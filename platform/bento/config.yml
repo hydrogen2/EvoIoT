@@ -1,0 +1,28 @@
+# EvoIoT Bento Configuration (Step 1 - Skeleton)
+# Real pipelines added in Step 3+
+
+http:
+  enabled: true
+  address: 0.0.0.0:4195
+
+# Metrics endpoint for Prometheus
+metrics:
+  prometheus:
+    use_histogram_timing: true
+
+logger:
+  level: INFO
+  format: logfmt
+
+# Placeholder input/output - will be replaced with real pipelines
+input:
+  generate:
+    interval: 60s
+    count: 0
+    mapping: |
+      root.status = "healthy"
+      root.service = "bento"
+      root.timestamp = now()
+
+output:
+  drop: {}

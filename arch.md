@@ -1,0 +1,777 @@
+# IoT Platform Architecture
+
+## Overview
+
+A small, beautiful, AI-first IoT platform for building monitoring. Built from open source components assembled and configured rather than coded. The philosophy throughout: store everything raw, decide meaning later, let AI discover what matters, generate functionality on demand.
+
+**Target scenario (v1):** BACnet buildings, single-building monitor app, one customer deployment.
+
+---
+
+## Core Philosophy
+
+### Immutable raw data
+Everything the edge agent observes is stored exactly as received. No filtering, no schema enforcement at ingestion. A reading that arrived is a permanent fact about what was observed — never overwritten, never discarded.
+
+### Schema on read
+Meaning is applied after storage, not before. The schema is a lens over data, not a gate. Unknown devices and points are stored as unclassified — not dropped.
+
+### Configuration over coding
+Every new device type, property definition, relationship type, and rule is expressed as configuration data (YAML, graph nodes, SQL) — not code. Code handles the engine. Configuration handles the behaviour.
+
+### AI-first, not AI-added
+AI changes what the platform can do, not just how you interact with it. Self-configuring (auto-discovery), self-explaining (causal answers), self-learning (anomaly detection), and conversational (NL queries).
+
+### Floor and ceiling
+Hardcode only the absolute floor: safety limits, auth, data ingestion, component primitives, audit trail. Let AI own the ceiling: classification, rules, screen assembly, query generation, anomaly detection.
+
+### AI as the learning engine
+The platform does not model the building — it learns the building. Schema, ontology, thresholds, and baselines are not designed upfront but grown continuously by AI from observation, ratified by humans.
+
+AI is responsible for: classifying new devices and data sources into TBox, proposing new TBox entries when it encounters novelty, calibrating rule thresholds from observed variance, learning normal behaviour per device per context, growing the ontology as the building reveals itself.
+
+Humans are responsible for: approving or rejecting AI proposals, setting intent (what matters, what to act on), providing the floor (safety rules, compliance limits).
+
+The TBox is not a schema designed once — it is an accumulated record of everything the platform has learned about the buildings it has observed. Each new building onboarded potentially contributes new TBox entries. The platform gets smarter with every deployment.
+
+### Open ingestion layer
+Sensor data and external API data are unified — they differ only in how they arrive. The platform ships with defaults (MQTT for edge agent sensor data, pre-built pipeline templates for common APIs) but the ingestion layer is fully open: users and AI can register any data source via the `data_sources` registry. Bento dynamically spawns pipelines for new entries. All data flows through the same normalisation and classification loop regardless of origin.
+
+---
+
+## Data Model
+
+### Five layers
+
+```
+Physical world
+    │  observation
+    ▼
+Layer 0 — raw immutable store
+    Everything as received. Never changes.
+    AGE graph for topology.
+    One readings table for all data (sensor + context):
+
+      CREATE TABLE readings (
+          id            uuid PRIMARY KEY,
+          building_id   text,       -- uuid or '*'
+          source_id     uuid,       -- references data_sources
+          source_type   text,       -- 'sensor'|'api'|'mqtt'|'file'
+          scope         text,       -- 'device'|'building'|'global'
+          device_id     uuid,       -- null for non-sensor sources
+          point_type    text,       -- TBox type or 'unclassified'
+          value         float,
+          unit          text,
+          raw_payload   jsonb,      -- immutable original
+          agent_read_at timestamptz,
+          confidence    float DEFAULT 1.0
+      );
+
+    TimescaleDB hypertable on agent_read_at.
+    device_id is nullable — present for sensor data,
+    null for context/API data. Partial indexes keep
+    queries fast without indexing null rows:
+
+      -- sensor queries: per device + point + time
+      CREATE INDEX readings_device_idx
+          ON readings (device_id, point_type, agent_read_at DESC)
+          WHERE device_id IS NOT NULL;
+
+      -- context queries: per building + point + time
+      CREATE INDEX readings_context_idx
+          ON readings (building_id, point_type, agent_read_at DESC)
+          WHERE device_id IS NULL;
+    │
+    ▼
+Layer 1 — semantic layer (TBox + ABox)
+    TBox: device type definitions, property schemas,
+          relationship definitions, Brick mappings.
+          Loaded from init YAML files at boot.
+    ABox: device instances, topology, classifications.
+          Populated by AI auto-classifier during onboarding.
+    Both live in Apache AGE (graph).
+    │
+    ▼
+Layer R — read lens (config-driven, applied at query time)
+    Gap fill, drift correction, confidence scoring,
+    simulation overlay, unit normalisation.
+    Implemented entirely in SQL — Postgres views and
+    functions, TimescaleDB gapfill. Zero application code.
+    Config lives in read_lens_config Postgres table
+    (seeded from read_lens_config.yaml at boot, then
+    maintained live via PostgREST).
+    Simulation results stored in TimescaleDB alongside
+    sensor readings (source='simulation') — lens prefers
+    sensor readings, falls back to simulation for gaps.
+    │
+    ▼
+Layer 2 — application projection
+    Typed views over Layer 1 for each app.
+    Subset of TBox properties the app cares about.
+    Expressed as Postgres views + PostgREST.
+    │
+    ▼
+Applications / AI / Rules
+```
+
+### TBox init files (configuration, not code)
+
+```
+platform/init/tbox/
+  device_types.yaml        AHU, Chiller, VAV, Pump...
+  property_defs.yaml       supply_air_temp, power_kw, cop...
+  relationship_defs.yaml   serves, located_in, monitors...
+  read_lens_config.yaml    gap fill, drift, fusion rules
+  brick_mappings.yaml      local types → Brick ontology classes
+  rule_definitions.yaml    streaming + scheduled rules
+```
+
+Device types, properties, and relationships are data — not Go structs. Adding a new device type means adding a row to the config, not a code change.
+
+### Data source registry
+
+All ingestion sources — platform defaults and user-defined — are registered in the `data_sources` table. Bento watches this table and dynamically spawns pipelines for new enabled entries.
+
+```sql
+CREATE TABLE data_sources (
+    id              uuid PRIMARY KEY,
+    building_id     text,           -- '*' or specific uuid
+    name            text,
+    source_type     text,           -- 'mqtt' | 'http_poll' | 'webhook'
+                                    -- | 'file' | 'bacnet' | 'modbus'
+    config          jsonb,          -- connection config (url, interval, headers)
+    transform       text,           -- Bloblang to normalise raw payload
+    enabled         boolean DEFAULT true,
+    registered_by   text,           -- 'platform' | 'user' | 'ai'
+    classification  text            -- 'classified' | 'pending' | 'rejected'
+);
+```
+
+Platform ships with defaults seeded from YAML (`registered_by = 'platform'`):
+- Edge agent MQTT connection
+- Pre-built HTTP pipeline templates (weather, electricity rates, busyness)
+
+Users and AI register new sources by inserting rows. The platform fetches a sample response, stores it raw, then the AI classifier proposes a `point_type` and optional TBox entry — same classification loop as BACnet unknown objects. Human approves. Data becomes queryable immediately.
+
+Context data property types live in the TBox alongside sensor types, with `source_type: context` to distinguish them. This makes them referenceable in rules, lens queries, and anomaly detection on equal footing with sensor data.
+
+### Read lens implementation
+
+The read lens is implemented entirely in SQL — no application service code. Three mechanisms work together:
+
+**Postgres views (unit normalisation, field aliasing)**
+Layer 2 projections are Postgres views that convert raw units and alias fields for each application. Declared once as DDL, served by PostgREST automatically.
+
+**TimescaleDB gapfill + Postgres functions (gap fill, drift correction, confidence)**
+A Postgres function `get_reading_with_lens()` wraps `time_bucket_gapfill()` (TimescaleDB built-in) and joins against `read_lens_config` to apply drift offsets and confidence factors at query time. Exposed via PostgREST RPC. Example:
+```sql
+-- gap fill with drift correction in one SQL function
+SELECT time_bucket_gapfill('5 minutes', agent_read_at),
+       interpolate(avg(value)) + COALESCE(lc.drift_offset, 0),
+       CASE WHEN value IS NULL THEN 0.5 ELSE lc.confidence_factor END
+FROM raw_readings r
+LEFT JOIN read_lens_config lc ON lc.device_id = r.device_id
+    AND lc.point_id = r.point_id
+    AND lc.valid_from <= r.agent_read_at
+    AND (lc.valid_to IS NULL OR lc.valid_to > r.agent_read_at)
+WHERE r.device_id = $1 AND agent_read_at BETWEEN $2 AND $3
+GROUP BY 1, lc.drift_offset, lc.confidence_factor;
+```
+
+**Simulation as a stored source (simulation overlay)**
+Simulation results (EnergyPlus or simpler thermal model) are stored in TimescaleDB alongside sensor readings with `source = 'simulation'`. The lens function prefers `source = 'sensor'` and falls back to `source = 'simulation'` for gaps. No special code path — just a UNION with priority ordering.
+
+**read_lens_config table**
+Runtime lens configuration lives in Postgres, not in YAML at runtime. The YAML file is the seed — loaded at boot into the table. Live changes (recalibration, new drift offsets) are made via PostgREST. The table is itself bitemporal (`valid_from`, `valid_to`) so historical queries automatically apply the correct calibration for the time period being queried.
+
+### v1 graph (current topology, no bitemporality)
+
+The graph stores current state of the building topology. Nodes are devices, zones, floors, gateways. Edges are typed relationships (serves, located_in, connected_to, monitors). TBox type nodes are linked to ABox instance nodes via IS_TYPE_OF edges.
+
+Bitemporality (valid_from, valid_to, recorded_at, superseded_at on edges) is deferred to v2. The upgrade path is additive — add four timestamp properties to edges and change the write path to append rather than update.
+
+### Why unified Postgres (AGE + TimescaleDB) over separate graph DB
+
+Both AGE and TimescaleDB are Postgres extensions sharing the same query executor. This means graph traversal results and time-series data can be joined in a single SQL statement — no application-layer join, no second round trip:
+
+```sql
+-- One query: graph traversal + time-series join
+-- All devices serving zone 3A + their last hour of readings
+SELECT
+    d.properties->>'raw_name'   AS device,
+    dt.properties->>'label'     AS type,
+    r.point_type,
+    r.value,
+    r.agent_read_at
+FROM cypher('platform', $$
+    MATCH (d:Device)-[:SERVES]->(z:Zone {id: 'zone-3a'})
+    MATCH (d)-[:IS_TYPE_OF]->(dt:DeviceType)
+    RETURN d, dt
+$$) AS (d agtype, dt agtype)
+JOIN readings r ON r.device_id = (d->>'id')::uuid
+WHERE r.agent_read_at > now() - interval '1 hour';
+```
+
+With a separate graph database (Kuzu, Neo4j), this requires two round trips and an application-layer join — the graph query returns device IDs, the application queries TimescaleDB with those IDs, the application merges the results. The Postgres query planner cannot optimise across both sides.
+
+The tradeoff: AGE implements a subset of openCypher and is not as performant as a purpose-built graph engine for deep traversals. For building topology (hundreds of nodes, queries rarely exceeding 3 hops) this is not a practical constraint. The unified query benefit is real and applies to every read operation the platform performs.
+
+---
+
+## System Components
+
+### Bill of Materials (v1)
+
+| Component | Role | License |
+|---|---|---|
+| Postgres 16 | Relational + audit + platform config | PostgreSQL |
+| TimescaleDB | Time-series extension | Apache 2 |
+| Apache AGE | Graph extension | Apache 2 |
+| PostgREST | Zero-code REST over Postgres | MIT |
+| Mosquitto | MQTT broker | EPL/EDL |
+| Bento | Stream processing + pipelines | MIT (community fork) |
+| BACnet discovery binary | Stateful network scan (Go subprocess) | yours |
+| Restate | Durable workflow engine | MIT |
+| Paho MQTT (inside Restate) | MQTT client library | Apache 2 |
+| Zitadel | Identity provider + JWT issuer | Apache 2 |
+| LiteLLM | LLM abstraction for AI classifier | MIT |
+| Prometheus | Metrics collection | Apache 2 |
+| Grafana | Dashboards + alerting | AGPL |
+| Loki + Promtail | Log aggregation | Apache 2 |
+
+**Not in v1:** Modbus support, temporal graph (bitemporality), Ollama, MinIO.
+
+---
+
+## Edge Agent
+
+### Philosophy
+The edge agent is a syncer. It synchronises ALL devices and readings from the BMS network to the platform. It decides nothing — no filtering, no classification, no interpretation. It is a faithful witness to the physical network.
+
+```
+Edge agent decides:    HOW to read (poll interval, batch size, retry)
+                       WHEN to read (schedule, discovery timing)
+
+Edge agent never:      WHAT to read (reads everything it finds)
+                       WHAT it means (platform classifies)
+                       WHETHER to store (always forwards all)
+```
+
+### Components
+
+```
+edge-agent/
+  binaries/
+    bacnet-discover    Go binary — stateful Who-Is/I-Am scan
+                       one-shot, outputs JSON to stdout, exits
+  config/
+    telemetry.yaml     Bento — polls Bento's BACnet read plugin
+                       publishes all readings to MQTT
+    discovery.yaml     Bento — runs bacnet-discover subprocess
+                       publishes discovery payload to MQTT (retained)
+    commands.yaml      Bento — receives commands from MQTT
+                       routes to bacnet-writer via subprocess
+  docker-compose.yaml
+```
+
+### Discovery flow
+
+```
+1. Run bacnet-discover binary (stateful: Who-Is → I-Am → ReadProperty)
+2. Binary outputs complete device+object list as JSON to stdout
+3. Bento discovery pipeline reads stdout
+4. Publishes to: buildings/{id}/agents/{id}/discovery (retained, QoS 1)
+5. Edge agent caches device+object list in SQLite (warm-start only)
+6. Begins polling ALL objects on ALL discovered devices
+7. Platform receives discovery payload, queues AI classification
+```
+
+### Polling
+- Polls every BACnet object on every discovered device
+- No enumeration in config — reads everything
+- Poll interval by object type category (analog-input: 60s, binary: 30s, etc.)
+- SQLite cache is warm-start optimisation only — loss = 30-60s rescan, not data loss
+- New objects detected on periodic rescan → added to polling, delta published to platform
+
+### Timestamp provenance
+BACnet and Modbus carry no timestamps. The edge agent's read time (`agent_read_at`) is the best available approximation of valid time. Every raw reading includes:
+- `agent_read_at` — always present
+- `protocol_ts` — present only if protocol provides (OPC-UA)
+- `clock_quality` — "ntp_synced" or "local_only"
+
+---
+
+## Platform
+
+### Data paths
+
+**Collection path (all sources → platform)**
+```
+All data sources converge on Bento ingestion pipeline:
+
+Edge agent (BACnet)    External webhook/push    External HTTP APIs
+  │  MQTT publish        │  HTTP POST              │  Bento scheduled pull
+  ▼                      ▼                         ▼
+Mosquitto            Bento http_server         Bento generate
+  │  Bento mqtt          │  input                  │  + http_client
+  │  client input        │                         │
+  └──────────────────────┴─────────────────────────┘
+                 │  User-registered sources
+                 │  (data_sources registry →
+                 │   dynamic Bento pipelines)
+                 ▼
+        Bento ingestion pipeline
+          ├── Protocol normalisation (Bloblang)
+          ├── Fusion / quality scoring
+          ├── Outlier detection + confidence tagging
+          └── Fan-out:
+              ├── TimescaleDB writer (readings table)
+              ├── Graph updater (device state in AGE)
+              └── Rule evaluator (streaming rules)
+```
+
+### Ingestion input types
+
+Bento supports two server-mode inputs and multiple client-mode inputs. MQTT is the one case where Bento cannot act as the server — it is always a client connecting to an external broker. This is the key architectural difference:
+
+```
+Input type      Bento role    Implementation      Notes
+──────────────  ────────────  ──────────────────  ─────────────────────────
+http_server     SERVER        Bento built-in      stateless request-response
+                              no external dep     each POST is independent
+                                                  natural fit for Bento input
+
+mqtt (client)   CLIENT        Bento built-in      connects to Mosquitto
+                              needs Mosquitto     stateful: subscriptions,
+                              as external broker  QoS, retained messages,
+                                                  per-client ACL — broker
+                                                  concerns Bento cannot own
+
+http_poll       CLIENT        Bento generate      Bento pulls on schedule
+                              + http_client       no inbound connections
+
+modbus          CLIENT        Bento modbus        Bento polls registers
+                              input plugin        no inbound connections
+
+bacnet          CLIENT        Go subprocess       stateful scan subprocess
+                              + Bento stdin       Bento reads stdout
+```
+
+Mosquitto remains a standalone service rather than being embedded in Bento for three reasons. First, failure isolation — a Bento pipeline crash should not kill the MQTT broker and disconnect all edge agents. Second, retained messages — Mosquitto persists retained discovery payloads to disk; an embedded broker would require explicit persistence management. Third, maturity — Mosquitto has a production-grade JWT ACL plugin; reimplementing this in a custom plugin adds risk with no benefit.
+
+### Uniform data_sources despite non-uniform implementation
+
+The `data_sources` registry achieves uniformity at the interface level. Each `source_type` maps to a Bento input configuration — the fact that `mqtt` uses an external broker while `http_server` is embedded is an implementation detail invisible to the registry:
+
+```
+source_type       data_sources registry    Bento implementation
+────────────────  ──────────────────────   ──────────────────────────────
+mqtt              { port: 1883,            Bento mqtt client input
+                    topics: [...] }          → Mosquitto (standalone)
+
+http_server       { port: 4195,            Bento http_server input
+                    path: /ingest }          (embedded, no broker)
+
+http_poll         { url: "...",            Bento generate input
+                    interval: "15m" }        + http_client processor
+
+modbus            { address: "...",        Bento modbus input plugin
+                    registers: [...] }
+
+bacnet            { network: "...",        bacnet-discover subprocess
+                    poll_interval: "60s" }   + Bento stdin input
+```
+
+From the `data_sources` table and the app UI, all source types look identical — a row with a `source_type` and a `config` JSONB blob. Bento's dynamic pipeline spawner translates each `source_type` into the correct input configuration. The MQTT/non-MQTT distinction is encapsulated inside the spawner, not exposed to users or operators.
+
+**Control path (downward: platform → BMS)**
+```
+App / Rule engine / AI
+    │  HTTP POST to Restate ingress
+    ▼
+Restate CommandObject (virtual object per device_id)
+    │  1. Validate against TBox + safety limits (Postgres)
+    │  2. Publish command via Paho → Mosquitto
+    │  3. Park awaiting ack (Restate awakeable, 30s timeout)
+    │  4. Record outcome in AGE graph
+    ▼
+Mosquitto broker
+    │  MQTT subscribe
+    ▼
+Edge agent (Bento command pipeline)
+    │  Routes to BACnet write subprocess
+    ▼
+BACnet WriteProperty → physical device
+    │  Ack published: buildings/{id}/agents/{id}/commands/ack
+    ▼
+Bento ack pipeline
+    │  HTTP POST to Restate AckReceived handler
+    ▼
+Restate resolves awakeable → workflow completes
+```
+
+### Processing layers
+
+**Streaming rules (Bento, before TSDB write)**
+Per-message, stateless, immediate. Safety limits, outlier isolation, unit conversion, CO2→damper direct response. Fires in milliseconds. These are platform-defined and operator-configured — facilities managers never write streaming rules.
+
+**Scheduled soft rules (Bento timer pipelines)**
+Queries TimescaleDB continuous aggregates every 1-5 minutes. Trend detection, sustained threshold violations, peer sensor drift. Covers ~80% of soft rule needs. Bento evaluates `rule_instances` rows from Postgres — adding a new user alert requires only inserting a row, no redeployment.
+
+**CEP correlation window (in-process Go)**
+~300 lines. Ring buffer of recent events per device. For the ~5% of patterns needing sub-minute multi-event correlation: cascade detection, rapid fault sequences, suppression patterns.
+
+**AI anomaly detection (continuous)**
+Model-based, learns normal per device per context (weekday/weekend, occupied/unoccupied, seasonal). Catches unknown unknowns. Replaces most explicit CEP needs.
+
+**Workflows (Restate)**
+Stateful, human-in-loop, long-running. Command dispatch, alert lifecycle, device onboarding, OTA updates, maintenance orders. Human-initiated or AI-proposed actions that need durability.
+
+### Rule routing principle
+
+```
+Program-generated data   → stream processing / scheduled pipelines
+Human-initiated tasks    → workflow engine
+```
+
+### Rule extensibility
+
+All rules — platform defaults and user-added custom rules — live in one `rules` table. A `source` column distinguishes ownership. A `'*'` wildcard on `building_id` and `device_id` means "applies to all":
+
+```sql
+CREATE TABLE rules (
+    id              uuid PRIMARY KEY,
+    building_id     text,     -- '*' = all buildings, uuid = one building
+    source          text,     -- 'platform' | 'user'
+    name            text,
+    point_type      text,     -- TBox property type
+    condition       text,     -- "value > threshold"
+    threshold       float,
+    severity        text,     -- 'P1' | 'P2' | 'P3'
+    device_id       text,     -- '*' = all devices of point_type, uuid = one device
+    notify_user_ids uuid[],
+    enabled         boolean DEFAULT true
+);
+```
+
+```
+source='platform'   platform defaults, always-on
+building_id='*'     seeded from rules.yaml at boot
+device_id='*'       operator-managed, read-only to users
+                    examples: equipment_fault, sensor_offline,
+                              co2_high, energy_spike
+
+source='user'       user-added building-specific rules
+building_id=uuid    created via app UI → PostgREST INSERT
+device_id=uuid      facilities manager owns these
+                    example: server room > 25°C on specific sensor
+```
+
+Platform defaults fire for every building with no configuration. User rules add the "I specifically want to know about this" layer on top. Bento evaluates all enabled rows for the building in one query. RLS ensures `source='platform'` rows are read-only to users.
+
+### Workflow extensibility
+
+Building operations has a small, knowable set of workflow patterns. Rather than a general flow designer, the platform provides a **workflow template library** — fixed Go/Restate patterns parameterised via configuration:
+
+```
+workflow_templates      platform pattern library (developer-defined)
+                        fixed Go + Restate handler code
+                        v1 templates:
+                          command_dispatch
+                          device_onboarding
+                          alert_lifecycle
+                          ota_update
+                          maintenance_task       ← configurable
+                          repair_order           ← configurable
+                          inspection_round       ← configurable
+
+workflow_configs        operator-configured instances of templates
+                        created via app UI → PostgREST INSERT
+                        picks a template, sets parameters:
+                          assignee_role, approver_role,
+                          sla_hours, escalation_chain,
+                          trigger conditions
+                        example:
+                          template: maintenance_task
+                          trigger: equipment_fault on chillers
+                          assignee: hvac_technician
+                          approver: facility_manager
+                          sla_hours: 4
+
+workflow_instances      Restate runtime (per execution)
+                        created when trigger condition fires
+                        tracks state in Restate embedded store
+```
+
+Platform developers write the template code once. Building operators configure workflow behaviours through the app. Facilities managers interact with running instances (acknowledge, approve, sign off). Nobody writes flow diagrams or custom code to add a maintenance order workflow — they configure a `maintenance_task` template instance.
+
+New workflow *patterns* that don't fit any template require a developer to write a new Restate handler. This is the hard floor — logic that varies per execution step cannot be expressed as configuration alone.
+
+---
+
+## API Surface
+
+No traditional API layer. Two surfaces cover everything:
+
+**PostgREST (zero code — all data access)**
+Auto-generated REST from Postgres schema + RLS. Frontend queries directly. JWT claims become Postgres session variables. RLS policies enforce building isolation automatically. Postgres functions expose graph (Cypher) queries as RPC endpoints.
+
+**Restate HTTP ingress (zero code — all workflow triggers)**
+Command dispatch, device scan trigger, alert acknowledgement, OTA initiation. Restate's built-in HTTP ingress routes to named workflow handlers. No custom endpoint code.
+
+
+
+---
+
+## Auth
+
+### Architecture
+One auth provider (Zitadel) translates all identity protocols into JWT. Platform components only speak JWT. Never touch LDAP/Kerberos/SAML directly.
+
+```
+Corporate LDAP/AD  ──→
+Google / GitHub    ──→  Zitadel  ──→  JWT with claims:
+SAML enterprise    ──→  (single       { sub, roles,
+Kerberos (via AD)  ──→   place)         building_id,
+Username/password  ──→                  org_id, exp }
+```
+
+### JWT custom claims
+Zitadel Actions inject `building_id` and `org_id` into every token at issuance. These flow through to:
+- **Postgres RLS** — session variables set by PostgREST, enforced per row
+- **MQTT ACL** — Mosquitto JWT plugin scopes topics to building
+- **Restate** — middleware validates + extracts claims before workflow dispatch
+
+### Machine identity
+Service accounts in Zitadel for: Bento (bento_writer role), Restate workflows (workflow_rw role), edge agents (edge_insert role + X.509 cert for MQTT). Issued during onboarding workflow.
+
+### Postgres roles
+```
+bento_writer       INSERT on readings, SELECT on tbox
+workflow_rw        SELECT on readings + tbox (for validation in workflow steps)
+edge_insert        INSERT on raw_readings only
+ai_reader          SELECT all (scoped by RLS)
+postgrest_role     SELECT/INSERT per RLS policy
+```
+
+---
+
+## Deployment Modes
+
+### Mode 1 — Public cloud SaaS
+Multi-tenant shared platform. One edge agent per customer building. Platform in cloud. Edge agents in customer buildings. Transport: MQTT over TLS. Isolation: Zitadel org per customer + Postgres RLS per building.
+
+### Mode 2 — Private cloud / on-prem server
+Single-tenant platform per customer. One edge agent per building. Platform on customer's server. Transport: MQTT over local network. Simpler isolation — single tenant.
+
+### Mode 3 — All-in-one on-prem
+Platform + edge agent on same host. Single building. Transport: MQTT on localhost (Mosquitto still used — same codebase, <1ms overhead, 5MB RAM). Air-gapped deployment possible. No internet required.
+
+**Multi-building:** Each building gets its own edge agent (and its own SQLite cache). All agents connect to one shared platform. Building isolation enforced via JWT claims + RLS.
+
+---
+
+## Security
+
+### Audit log
+Postgres append-only table with hash chain. Application user has INSERT only — UPDATE and DELETE revoked. Each row's hash includes the previous row's hash (SHA256). Tamper detection: any modification breaks the chain. Covers all operational audit (who commanded what, when, outcome).
+
+Security-sensitive events (auth, permission changes, API key use) go to the same audit table but are additionally tagged `security: true` for compliance queries.
+
+### Data backup
+**Two backup targets: Postgres + Restate volume.**
+
+Postgres contains:
+- TimescaleDB hypertable (telemetry)
+- AGE graph (topology, TBox, ABox)
+- Audit log
+- Config tables (rules, lens config, notifiers)
+- Zitadel identity data (shares Postgres instance)
+
+Restate contains:
+- Workflow state (durable execution journal)
+- In-flight command lifecycle
+- Awakeable state
+- Stored in embedded RocksDB (Docker volume)
+- Back up as a volume snapshot alongside Postgres
+
+Strategy: continuous WAL archiving (point-in-time recovery) + daily pg_dump + weekly volume snapshot.
+
+Everything else (Mosquitto retained messages, Prometheus metrics, Loki logs, Bento state) is ephemeral — loss is tolerable, reconstructable, or operationally irrelevant.
+
+---
+
+## Observability
+
+Pure configuration — zero custom code beyond three lines of `promhttp.Handler()` in the Go API binary.
+
+```
+Prometheus          scrapes: Postgres exporter, Bento /metrics,
+                    Restate /metrics, Mosquitto exporter,
+                    platform API /metrics (Go runtime)
+
+Grafana             community dashboards imported by ID
+                    custom platform dashboard exported as JSON
+                    provisioned at boot from config files
+
+Loki + Promtail     auto-discovers all Docker containers
+                    ships logs by container name label
+                    30-day retention
+```
+
+---
+
+## Resource Requirements
+
+| Component | Image | RAM (idle) |
+|---|---|---|
+| Postgres + TimescaleDB + AGE | ~500 MB | ~300 MB |
+| PostgREST | 5 MB | 30–50 MB |
+| Mosquitto | 5 MB | 5–15 MB |
+| Bento | 40 MB | 50–100 MB |
+| Restate | 60 MB | 80–150 MB |
+| Zitadel | 60 MB | 100–150 MB |
+| LiteLLM | 500 MB | 200–300 MB |
+| Prometheus + Grafana + Loki | ~560 MB | ~400 MB |
+| Platform binaries (Go) | ~20 MB | ~50 MB |
+| **Total** | **~1.8 GB pull** | **~1.4–2.0 GB idle** |
+
+**Recommended host:** 4 GB RAM, 2 vCPUs, 50 GB SSD (one building, one year).
+
+**Disk growth:** ~40–65 MB/day compressed telemetry (150 devices × 30 points × 60s polling, TimescaleDB 10–20× compression).
+
+---
+
+## Development Sequence
+
+Always runnable from day one. Each step adds features without breaking what exists.
+
+**Step 1 — Postgres schema + docker-compose skeleton**
+All services in docker-compose, none doing anything meaningful yet. Postgres initialises with full DDL — all tables, RLS policies, Postgres roles, AGE graph labels and edge types, TimescaleDB hypertable, partial indexes. Zitadel, PostgREST, Mosquitto, Bento, Restate, Prometheus, Grafana, Loki all start.
+
+```
+postgres/initdb/
+  01_schema.sql       all table DDL, hypertable, indexes, RLS, roles
+  03_rules_seed.sql   platform default rules (source='platform')
+  04_data_sources.sql platform default data source registrations
+
+Verifiable: docker compose up → all services healthy
+            PostgREST /readings returns empty array
+            AGE graph exists with labels defined
+```
+
+**Step 2 — TBox seed data**
+A single SQL migration file with Cypher INSERT statements for DeviceType, PropertyDef, RelationshipDef nodes and HAS_PROPERTY edges. No YAML, no service code — Postgres runs it automatically at boot via `/docker-entrypoint-initdb.d/`.
+
+```
+postgres/initdb/
+  02_tbox_seed.sql    Cypher INSERTs for TBox nodes and edges
+                      DeviceType: AHU, VAV, Chiller, Pump...
+                      PropertyDef: supply_air_temp, power_kw...
+                      RelationshipDef: serves, located_in...
+                      HAS_PROPERTY edges linking types to properties
+
+Verifiable: SELECT * FROM cypher('platform', $$
+              MATCH (dt:DeviceType) RETURN dt
+            $$) AS (dt agtype);
+            → returns AHU, VAV, Chiller...
+```
+
+**Step 3 — Edge agent skeleton with synthetic data**
+Edge agent docker-compose. Bento telemetry pipeline publishes synthetic fake readings to Mosquitto. Platform ingestion pipeline subscribes and writes to `readings` table. First end-to-end data flow.
+
+```
+Verifiable: SELECT COUNT(*) FROM readings > 0
+            PostgREST /readings returns data
+```
+
+**Step 4 — Real BACnet data**
+`bacnet-discover` Go binary. Discovery pipeline publishes device+object payload to MQTT. Platform stores raw devices in `data_sources`. All BACnet objects land in `readings` as `point_type = 'unclassified'`.
+
+```
+Verifiable: unclassified readings flowing from real BMS
+            discovery payload visible in data_sources table
+```
+
+**Step 5 — AI classifier**
+LiteLLM call with TBox context proposes classifications for unclassified devices and points. Proposals written to `classification_proposals` table. Minimal approval UI — human clicks approve, AGE graph nodes and IS_TYPE_OF edges created.
+
+```
+Verifiable: Device nodes in AGE graph after approval
+            classified readings queryable by point_type
+```
+
+**Step 6 — Building monitor app (basic)**
+Next.js shell connects directly to PostgREST. Device list from graph. Live readings from TimescaleDB. No auth yet — single hardcoded building for development.
+
+```
+Verifiable: browser shows real device readings updating live
+```
+
+**Step 7 — Auth**
+JWT flow wired. PostgREST validates tokens. RLS enforces building isolation. Zitadel Actions inject building_id claim. MQTT ACL enabled.
+
+```
+Verifiable: login required
+            user from building A cannot see building B data
+```
+
+**Step 8 — Read lens**
+Postgres functions for gap fill, drift correction, confidence scoring. `read_lens_config` seeded with defaults. PostgREST exposes lens functions as RPC. App switches from raw to lens-filtered readings.
+
+```
+Verifiable: sensor gap shows interpolated values with lower confidence
+            drift offset applied transparently
+```
+
+**Step 9 — Rules engine**
+Platform default rules seeded. Bento scheduled pipeline evaluates `rules` table every 5 minutes against TimescaleDB. Alerts written to `alerts` table. App shows alert list.
+
+```
+Verifiable: set sensor above threshold → alert appears in UI
+```
+
+**Step 10 — Command dispatch**
+Restate CommandObject workflow. Paho publishes to edge agent via Mosquitto. Edge agent executes BACnet WriteProperty. Ack returns via Bento → Restate awakeable. App sends setpoint command.
+
+```
+Verifiable: UI sends command → physical device changes → ack recorded
+```
+
+**Step 11 — Workflow templates**
+`workflow_templates` and `workflow_configs` seeded. Alert lifecycle workflow in Restate — alert fires → maintenance task → assigned → sign-off → resolved. App shows workflow inbox.
+
+```
+Verifiable: alert triggers maintenance task, operator signs off
+            full lifecycle recorded in audit log
+```
+
+**Step 12 — External context data**
+Bento HTTP pipeline templates for weather, electricity rates. Platform default `data_sources` seeded. Context readings flowing into `readings` table (device_id=null, scope='global'/'building').
+
+```
+Verifiable: outdoor_temperature visible alongside sensor data
+            electricity rate referenceable in rules
+```
+
+**Step 13 — User-defined data sources**
+App UI to register a new HTTP data source. Bento watcher dynamically spawns pipeline. AI classifies new point type. Human approves. Custom data visible in app.
+
+```
+Verifiable: user registers API → data flows → AI classifies → approved
+```
+
+**Step 14 — User-defined rules**
+App UI to add custom rule — pick point type, threshold, device, notify. PostgREST INSERT into rules (source='user'). Bento evaluates on next cycle.
+
+```
+Verifiable: user rule fires independently of platform defaults
+```
+
+**Step 15 — Multi-building**
+Second building, second edge agent, same platform. Building isolation verified. Deployment Mode 2 docker-compose variant written.
+
+```
+Verifiable: two buildings fully isolated
+            each building's users see only their own data
+```

@@ -1,0 +1,343 @@
+# EvoIoT Platform - Docker Compose (Step 1)
+# All services running, Postgres initialized with full schema
+
+name: evoiot
+
+services:
+  # ==========================================================================
+  # Core Database
+  # ==========================================================================
+  postgres:
+    build: ./postgres
+    container_name: evoiot-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    command:
+      - "-c"
+      - "shared_preload_libraries=timescaledb,age"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    networks:
+      - evoiot
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ==========================================================================
+  # API Layer
+  # ==========================================================================
+  postgrest:
+    image: postgrest/postgrest:v12.2.3
+    container_name: evoiot-postgrest
+    environment:
+      PGRST_DB_URI: postgres://postgrest_role:postgrest_dev_password@postgres:5432/postgres
+      PGRST_DB_SCHEMAS: evoiot
+      PGRST_DB_ANON_ROLE: postgrest_anon
+      PGRST_JWT_SECRET: "dev-jwt-secret-change-in-production-min-32-chars"
+      PGRST_DB_EXTRA_SEARCH_PATH: ag_catalog
+      PGRST_OPENAPI_SERVER_PROXY_URI: http://localhost:3000
+    ports:
+      - "3000:3000"
+    networks:
+      - evoiot
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ==========================================================================
+  # Message Broker
+  # ==========================================================================
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: evoiot-mosquitto
+    volumes:
+      - ./mosquitto/config:/mosquitto/config:ro
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    networks:
+      - evoiot
+    healthcheck:
+      test: ["CMD", "mosquitto_sub", "-t", "$$SYS/#", "-C", "1", "-i", "healthcheck", "-W", "3"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ==========================================================================
+  # Stream Processing
+  # ==========================================================================
+  bento:
+    image: ghcr.io/warpstreamlabs/bento:latest
+    container_name: evoiot-bento
+    volumes:
+      - ./bento:/etc/bento:ro
+    command: ["-c", "/etc/bento/config.yml"]
+    ports:
+      - "4195:4195"
+    networks:
+      - evoiot
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:4195/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ==========================================================================
+  # Workflow Engine
+  # ==========================================================================
+  restate:
+    image: restatedev/restate:1.1
+    container_name: evoiot-restate
+    volumes:
+      - restate_data:/restate-data
+    ports:
+      - "8080:8080"   # Ingress
+      - "9070:9070"   # Admin
+      - "9081:9081"   # Metrics
+    networks:
+      - evoiot
+    environment:
+      RESTATE_OBSERVABILITY__LOG__FORMAT: json
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9070/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ==========================================================================
+  # Identity Provider
+  # ==========================================================================
+  zitadel:
+    image: ghcr.io/zitadel/zitadel:v2.62.1
+    container_name: evoiot-zitadel
+    command: start-from-init --masterkeyFromEnv --tlsMode disabled
+    environment:
+      ZITADEL_MASTERKEY: "evoiot-masterkey-exactly32chars!"
+      ZITADEL_DATABASE_POSTGRES_HOST: postgres
+      ZITADEL_DATABASE_POSTGRES_PORT: 5432
+      ZITADEL_DATABASE_POSTGRES_DATABASE: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_USERNAME: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_PASSWORD: zitadel_dev_password
+      ZITADEL_DATABASE_POSTGRES_USER_SSL_MODE: disable
+      ZITADEL_DATABASE_POSTGRES_ADMIN_USERNAME: postgres
+      ZITADEL_DATABASE_POSTGRES_ADMIN_PASSWORD: postgres
+      ZITADEL_DATABASE_POSTGRES_ADMIN_SSL_MODE: disable
+      ZITADEL_EXTERNALDOMAIN: localhost
+      ZITADEL_EXTERNALPORT: 8085
+      ZITADEL_EXTERNALSECURE: "false"
+      ZITADEL_FIRSTINSTANCE_ORG_NAME: EvoIoT
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_USERNAME: admin@evoiot.local
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORD: Admin123!
+    ports:
+      - "8085:8080"
+    networks:
+      - evoiot
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/debug/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  # ==========================================================================
+  # LLM Abstraction
+  # ==========================================================================
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: evoiot-litellm
+    environment:
+      # Configure your LLM API keys here
+      # OPENAI_API_KEY: ${OPENAI_API_KEY}
+      # ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      LITELLM_MASTER_KEY: "sk-dev-master-key"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/postgres
+    ports:
+      - "4000:4000"
+    networks:
+      - evoiot
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ==========================================================================
+  # Observability Stack
+  # ==========================================================================
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: evoiot-prometheus
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    ports:
+      - "9090:9090"
+    networks:
+      - evoiot
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: evoiot-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: http://localhost:3001
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3001:3000"
+    networks:
+      - evoiot
+    depends_on:
+      - prometheus
+      - loki
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.1.0
+    container_name: evoiot-loki
+    volumes:
+      - ./loki:/etc/loki:ro
+      - loki_data:/loki
+    command: -config.file=/etc/loki/loki-config.yml
+    ports:
+      - "3100:3100"
+    networks:
+      - evoiot
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3100/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:3.1.0
+    container_name: evoiot-promtail
+    volumes:
+      - ./promtail:/etc/promtail:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: -config.file=/etc/promtail/promtail-config.yml
+    networks:
+      - evoiot
+    depends_on:
+      - loki
+    restart: unless-stopped
+
+  # ==========================================================================
+  # Graph Visualization
+  # ==========================================================================
+  age-viewer:
+    image: sorrell/apache-age-viewer:latest
+    container_name: evoiot-age-viewer
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/postgres
+    ports:
+      - "3002:3001"
+    networks:
+      - evoiot
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ==========================================================================
+  # Exporters (for Prometheus)
+  # ==========================================================================
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: evoiot-postgres-exporter
+    environment:
+      DATA_SOURCE_NAME: postgres://postgres:postgres@postgres:5432/postgres?sslmode=disable
+    ports:
+      - "9187:9187"
+    networks:
+      - evoiot
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  mosquitto-exporter:
+    image: sapcc/mosquitto-exporter:0.8.0
+    container_name: evoiot-mosquitto-exporter
+    environment:
+      BROKER_ENDPOINT: tcp://mosquitto:1883
+    ports:
+      - "9234:9234"
+    networks:
+      - evoiot
+    depends_on:
+      mosquitto:
+        condition: service_healthy
+    restart: unless-stopped
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  evoiot:
+    driver: bridge
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  postgres_data:
+  mosquitto_data:
+  mosquitto_log:
+  restate_data:
+  prometheus_data:
+  grafana_data:
+  loki_data:

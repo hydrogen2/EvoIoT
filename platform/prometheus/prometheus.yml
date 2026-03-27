@@ -1,0 +1,48 @@
+# EvoIoT Prometheus Configuration
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # PostgreSQL (via postgres_exporter)
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+
+  # Mosquitto MQTT Broker
+  - job_name: 'mosquitto'
+    static_configs:
+      - targets: ['mosquitto-exporter:9234']
+
+  # Bento Stream Processor
+  - job_name: 'bento'
+    static_configs:
+      - targets: ['bento:4195']
+
+  # Restate Workflow Engine
+  - job_name: 'restate'
+    static_configs:
+      - targets: ['restate:9081']
+
+  # Zitadel Identity Provider
+  - job_name: 'zitadel'
+    static_configs:
+      - targets: ['zitadel:8080']
+    metrics_path: /debug/metrics
+
+  # LiteLLM
+  - job_name: 'litellm'
+    static_configs:
+      - targets: ['litellm:4000']
+    metrics_path: /metrics
+
+  # Loki (log aggregation)
+  - job_name: 'loki'
+    static_configs:
+      - targets: ['loki:3100']

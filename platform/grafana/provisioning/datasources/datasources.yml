@@ -1,0 +1,34 @@
+# EvoIoT Grafana Datasources
+
+apiVersion: 1
+
+datasources:
+  # Prometheus - metrics
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+
+  # Loki - logs
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false
+
+  # PostgreSQL - direct queries (optional)
+  - name: PostgreSQL
+    type: postgres
+    url: postgres:5432
+    database: postgres
+    user: grafana_reader
+    secureJsonData:
+      password: grafana_dev_password
+    jsonData:
+      sslmode: disable
+      maxOpenConns: 5
+      maxIdleConns: 2
+      connMaxLifetime: 14400
+    editable: false
