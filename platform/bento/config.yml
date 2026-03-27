@@ -1,11 +1,10 @@
-# EvoIoT Bento Configuration (Step 1 - Skeleton)
-# Real pipelines added in Step 3+
+# EvoIoT Platform - Bento Ingestion Pipeline (Step 3)
+# Subscribes to MQTT telemetry and writes to TimescaleDB
 
 http:
   enabled: true
   address: 0.0.0.0:4195
 
-# Metrics endpoint for Prometheus
 metrics:
   prometheus:
     use_histogram_timing: true
@@ -14,15 +13,67 @@ logger:
   level: INFO
   format: logfmt
 
-# Placeholder input/output - will be replaced with real pipelines
 input:
-  generate:
-    interval: 60s
-    count: 0
-    mapping: |
-      root.status = "healthy"
-      root.service = "bento"
-      root.timestamp = now()
+  mqtt:
+    urls:
+      - tcp://mosquitto:1883
+    topics:
+      - "buildings/+/agents/+/telemetry"
+    client_id: "platform-ingestion"
+    qos: 1
+    auto_replay_nacks: true
+
+pipeline:
+  processors:
+    # Parse the incoming message
+    - log:
+        level: DEBUG
+        message: "Received telemetry: ${! json() }"
+
+    # Add metadata
+    - mapping: |
+        root = this
+        root.id = uuid_v4()
+        root.source_type = "sensor"
+        root.scope = "device"
+        root.confidence = 1.0
+        root.created_at = now()
+
+        # Store raw payload
+        root.raw_payload = this.string()
 
 output:
-  drop: {}
+  sql_insert:
+    driver: postgres
+    dsn: "postgres://bento_writer:bento_dev_password@postgres:5432/postgres?sslmode=disable"
+    table: evoiot.readings
+    columns:
+      - id
+      - building_id
+      - source_type
+      - scope
+      - device_id
+      - point_type
+      - value
+      - unit
+      - raw_payload
+      - agent_read_at
+      - confidence
+    args_mapping: |
+      root = [
+        this.id,
+        this.building_id,
+        this.source_type,
+        this.scope,
+        this.device_id,
+        this.point_type,
+        this.value,
+        this.unit,
+        this.raw_payload,
+        this.agent_read_at,
+        this.confidence
+      ]
+    init_statement: ""
+    batching:
+      count: 100
+      period: 1s

@@ -65,7 +65,7 @@ CREATE TABLE evoiot.readings (
     source_id       UUID REFERENCES evoiot.data_sources(id),
     source_type     TEXT NOT NULL,              -- 'sensor' | 'api' | 'mqtt' | 'file'
     scope           TEXT NOT NULL,              -- 'device' | 'building' | 'global'
-    device_id       UUID,                       -- null for non-sensor sources
+    device_id       TEXT,                       -- null for non-sensor sources
     point_type      TEXT NOT NULL,              -- TBox type or 'unclassified'
     value           DOUBLE PRECISION,
     unit            TEXT,
@@ -96,7 +96,7 @@ CREATE INDEX readings_building_time_idx
 -- Read Lens Configuration
 CREATE TABLE evoiot.read_lens_config (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    device_id       UUID,
+    device_id       TEXT,
     point_type      TEXT NOT NULL,
     drift_offset    DOUBLE PRECISION DEFAULT 0,
     confidence_factor DOUBLE PRECISION DEFAULT 1.0,
@@ -242,6 +242,12 @@ CREATE POLICY readings_select_policy ON evoiot.readings
 CREATE POLICY readings_insert_policy ON evoiot.readings
     FOR INSERT
     WITH CHECK (TRUE);  -- Services handle insert validation
+
+-- Anonymous access for development (remove in production)
+CREATE POLICY readings_anon_select ON evoiot.readings
+    FOR SELECT
+    TO postgrest_anon
+    USING (true);
 
 -- RLS Policies: data_sources
 CREATE POLICY data_sources_select_policy ON evoiot.data_sources

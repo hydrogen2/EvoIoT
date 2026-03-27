@@ -1,0 +1,22 @@
+# EvoIoT Edge Agent - Docker Compose (Step 3 - Synthetic Data)
+# Simulates BACnet device readings and publishes to platform MQTT
+
+name: evoiot-edge
+
+services:
+  # ==========================================================================
+  # Telemetry Pipeline - Synthetic Data Generator
+  # ==========================================================================
+  telemetry:
+    image: ghcr.io/warpstreamlabs/bento:latest
+    container_name: edge-telemetry
+    volumes:
+      - ./config:/etc/bento:ro
+    command: ["-c", "/etc/bento/telemetry.yaml"]
+    networks:
+      - evoiot_evoiot  # Connect to platform network
+    restart: unless-stopped
+
+networks:
+  evoiot_evoiot:
+    external: true
