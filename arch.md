@@ -230,7 +230,7 @@ The tradeoff: AGE implements a subset of openCypher and is not as performant as 
 | PostgREST | Zero-code REST over Postgres | MIT |
 | Mosquitto | MQTT broker | EPL/EDL |
 | Bento | Stream processing + pipelines | MIT (community fork) |
-| BACnet discovery binary | Stateful network scan (Go subprocess) | yours |
+| BAC0 / BACpypes3 | BACnet/IP discovery + polling (Python) | LGPL |
 | Restate | Durable workflow engine | MIT |
 | Paho MQTT (inside Restate) | MQTT client library | Apache 2 |
 | Zitadel | Identity provider + JWT issuer | Apache 2 |
@@ -257,41 +257,98 @@ Edge agent never:      WHAT to read (reads everything it finds)
                        WHETHER to store (always forwards all)
 ```
 
+### Architecture: Producer → Queue → Consumer
+
+The edge agent uses a decoupled architecture with clear separation of concerns:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         Edge Agent                              │
+│                                                                 │
+│  ┌──────────────────┐                                           │
+│  │  Python Scripts  │  PRODUCERS                                │
+│  │  (supervisord)   │  - discover.py: BACnet Who-Is/I-Am scan   │
+│  │                  │  - poller.py: continuous COV/polling      │
+│  └────────┬─────────┘                                           │
+│           │ INSERT                                              │
+│           ▼                                                     │
+│  ┌──────────────────┐                                           │
+│  │     SQLite       │  QUEUE + BUFFER + CONFIG                  │
+│  │   (WAL mode)     │  - devices table: discovered inventory    │
+│  │                  │  - readings table: telemetry buffer       │
+│  │                  │  - (future) config: poll intervals, etc.  │
+│  └────────┬─────────┘                                           │
+│           │ SELECT                                              │
+│           ▼                                                     │
+│  ┌──────────────────┐                                           │
+│  │  Bento Streams   │  CONSUMER                                 │
+│  │  (single proc)   │  - discovery.yaml: publish device list    │
+│  │                  │  - uploader.yaml: publish readings        │
+│  └────────┬─────────┘                                           │
+│           │ MQTT                                                │
+└───────────┼─────────────────────────────────────────────────────┘
+            ▼
+      Mosquitto → Platform
+```
+
+**Why this pattern:**
+- **Decoupling**: Protocol libraries (BAC0/BACpypes3) run in Python; streaming/publishing runs in Bento. Neither blocks the other.
+- **Resilience**: SQLite buffers readings during network outages. Bento retries from last uploaded row.
+- **Simplicity**: No custom queue service. SQLite WAL mode handles concurrent reads/writes.
+- **Extensibility**: SQLite can store config data (poll intervals, object filters) that Python reads at runtime.
+
 ### Components
 
 ```
 edge-agent/
-  binaries/
-    bacnet-discover    Go binary — stateful Who-Is/I-Am scan
-                       one-shot, outputs JSON to stdout, exits
-  config/
-    telemetry.yaml     Bento — polls Bento's BACnet read plugin
-                       publishes all readings to MQTT
-    discovery.yaml     Bento — runs bacnet-discover subprocess
-                       publishes discovery payload to MQTT (retained)
-    commands.yaml      Bento — receives commands from MQTT
-                       routes to bacnet-writer via subprocess
+  scripts/
+    init_db.py         initialise SQLite schema (WAL mode)
+    discover.py        BACnet discovery via BAC0 (async)
+                       Who-Is broadcast → I-Am responses
+                       ReadPropertyMultiple for object lists
+                       writes to devices + objects tables
+    poller.py          continuous polling via BAC0 (async)
+                       reads presentValue from all objects
+                       writes to readings table
+  config/streams/
+    discovery.yaml     Bento stream — SELECT from devices/objects
+                       publish JSON to MQTT discovery topic
+                       runs on interval (default 60s)
+    uploader.yaml      Bento stream — SELECT unuploaded readings
+                       publish to MQTT telemetry topic
+                       UPDATE uploaded=1 on success
+  supervisord.conf     process manager — runs discover, poller, bento
+  Dockerfile           Python 3.11 + BAC0 + Bento binary
   docker-compose.yaml
 ```
 
 ### Discovery flow
 
 ```
-1. Run bacnet-discover binary (stateful: Who-Is → I-Am → ReadProperty)
-2. Binary outputs complete device+object list as JSON to stdout
-3. Bento discovery pipeline reads stdout
-4. Publishes to: buildings/{id}/agents/{id}/discovery (retained, QoS 1)
-5. Edge agent caches device+object list in SQLite (warm-start only)
-6. Begins polling ALL objects on ALL discovered devices
-7. Platform receives discovery payload, queues AI classification
+1. discover.py runs BACnet Who-Is broadcast (BAC0 async)
+2. Waits for I-Am responses, collects device addresses
+3. For each device: ReadPropertyMultiple to enumerate objects
+4. Writes device + object metadata to SQLite
+5. Bento discovery stream (on interval):
+   - SELECT from devices/objects tables
+   - Publishes to: buildings/{id}/agents/{id}/discovery (QoS 1)
+6. Platform receives payload, creates RawTag nodes in graph
+7. poller.py starts polling all discovered objects
 ```
 
 ### Polling
-- Polls every BACnet object on every discovered device
-- No enumeration in config — reads everything
+- `poller.py` polls every BACnet object on every discovered device
+- No enumeration in config — reads everything found in SQLite
 - Poll interval by object type category (analog-input: 60s, binary: 30s, etc.)
-- SQLite cache is warm-start optimisation only — loss = 30-60s rescan, not data loss
-- New objects detected on periodic rescan → added to polling, delta published to platform
+- Readings written to SQLite with `uploaded=0`
+- Bento uploader stream: SELECT WHERE uploaded=0, publish, UPDATE uploaded=1
+- New objects detected on periodic rescan → added to SQLite, polling begins automatically
+
+### SQLite as buffer
+- WAL mode enables concurrent read (Bento) + write (Python) without locking
+- Survives network outages — readings accumulate until connectivity restored
+- Survives process restarts — Bento resumes from last uploaded reading
+- Future: config table for runtime-adjustable poll intervals, object filters
 
 ### Timestamp provenance
 BACnet and Modbus carry no timestamps. The edge agent's read time (`agent_read_at`) is the best available approximation of valid time. Every raw reading includes:
@@ -686,11 +743,14 @@ Verifiable: SELECT COUNT(*) FROM readings > 0
 ```
 
 **Step 4 — Real BACnet data**
-`bacnet-discover` Go binary. Discovery pipeline publishes device+object payload to MQTT. Platform stores raw devices in `data_sources`. All BACnet objects land in `readings` as `point_type = 'unclassified'`.
+Edge agent with Python BACnet scripts (BAC0/BACpypes3), SQLite queue, Bento streams. Discovery publishes device+object payload to MQTT. Platform creates RawTag nodes in AGE graph via Cypher MERGE. Telemetry flows to TimescaleDB readings table as `point_type = 'unclassified'`.
 
 ```
 Verifiable: unclassified readings flowing from real BMS
-            discovery payload visible in data_sources table
+            RawTag nodes visible in AGE graph
+            SELECT * FROM cypher('platform', $$
+              MATCH (t:RawTag) RETURN count(t)
+            $$) AS (count agtype);
 ```
 
 **Step 5 — AI classifier**
