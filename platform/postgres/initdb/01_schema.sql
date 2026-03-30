@@ -306,11 +306,19 @@ CREATE POLICY workflow_configs_select_policy ON evoiot.workflow_configs
 -- Role Permissions
 -- =============================================================================
 
--- bento_writer: INSERT on readings, SELECT on tbox-related
+-- bento_writer: INSERT on readings, SELECT on tbox-related, AGE graph access
 GRANT SELECT ON ALL TABLES IN SCHEMA evoiot TO bento_writer;
 GRANT INSERT ON evoiot.readings TO bento_writer;
 GRANT INSERT ON evoiot.alerts TO bento_writer;
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA evoiot TO bento_writer;
+-- AGE catalog access
+GRANT USAGE ON SCHEMA ag_catalog TO bento_writer;
+GRANT SELECT ON ALL TABLES IN SCHEMA ag_catalog TO bento_writer;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA ag_catalog TO bento_writer;
+-- AGE graph schema access (platform graph)
+GRANT ALL ON SCHEMA platform TO bento_writer;
+GRANT ALL ON ALL TABLES IN SCHEMA platform TO bento_writer;
+GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA platform TO bento_writer;
 
 -- workflow_rw: SELECT on readings + tbox (for validation)
 GRANT SELECT ON ALL TABLES IN SCHEMA evoiot TO workflow_rw;

@@ -1,22 +1,84 @@
-# EvoIoT Edge Agent - Docker Compose (Step 3 - Synthetic Data)
-# Simulates BACnet device readings and publishes to platform MQTT
+# EvoIoT Edge Agent - Docker Compose (Step 4 - Real BACnet)
+# BACnet simulator + Python/BAC0 discovery and polling
 
 name: evoiot-edge
 
 services:
   # ==========================================================================
-  # Telemetry Pipeline - Synthetic Data Generator
+  # BACnet Simulator (Development Only)
+  # Simulates 3 BACnet devices with realistic HVAC objects
   # ==========================================================================
-  telemetry:
-    image: ghcr.io/warpstreamlabs/bento:latest
-    container_name: edge-telemetry
-    volumes:
-      - ./config:/etc/bento:ro
-    command: ["-c", "/etc/bento/telemetry.yaml"]
+  bacnet-sim-1:
+    image: bacnet-simulator:local
+    container_name: bacnet-sim-1
+    environment:
+      SIMULATOR_DEVICE_ID: "1112"
+      SIMULATOR_IP_ADDRESS: "192.168.100.10"
     networks:
-      - evoiot_evoiot  # Connect to platform network
+      bacnet:
+        ipv4_address: 192.168.100.10
+    restart: unless-stopped
+
+  bacnet-sim-2:
+    image: bacnet-simulator:local
+    container_name: bacnet-sim-2
+    environment:
+      SIMULATOR_DEVICE_ID: "1113"
+      SIMULATOR_IP_ADDRESS: "192.168.100.11"
+    networks:
+      bacnet:
+        ipv4_address: 192.168.100.11
+    restart: unless-stopped
+
+  bacnet-sim-3:
+    image: bacnet-simulator:local
+    container_name: bacnet-sim-3
+    environment:
+      SIMULATOR_DEVICE_ID: "1114"
+      SIMULATOR_IP_ADDRESS: "192.168.100.12"
+    networks:
+      bacnet:
+        ipv4_address: 192.168.100.12
+    restart: unless-stopped
+
+  # ==========================================================================
+  # Edge Agent - BACnet Discovery + Polling + Upload
+  # ==========================================================================
+  edge-agent:
+    build: .
+    container_name: edge-agent
+    environment:
+      BUILDING_ID: "bldg-001"
+      SOURCE_ID: "bacnet-sim"
+      AGENT_ID: "agent-001"
+      BACNET_IP: "192.168.100.5"
+      BACNET_SUBNET: "24"
+      POLL_INTERVAL: "10"
+      DISCOVERY_INTERVAL: "300"
+      LOG_LEVEL: "INFO"
+    volumes:
+      - edge_data:/data
+    networks:
+      bacnet:
+        ipv4_address: 192.168.100.5  # Static IP for BACnet binding
+      evoiot_evoiot: {}  # Connect to platform network for MQTT
+    depends_on:
+      - bacnet-sim-1
+      - bacnet-sim-2
+      - bacnet-sim-3
     restart: unless-stopped
 
 networks:
+  # BACnet network for simulator communication
+  bacnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.100.0/24
+
+  # Platform network for MQTT
   evoiot_evoiot:
     external: true
+
+volumes:
+  edge_data:

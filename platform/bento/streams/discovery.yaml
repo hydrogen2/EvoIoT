@@ -1,0 +1,94 @@
+# Discovery Stream - MQTT to AGE Graph
+# Subscribes to discovery topic and creates RawTag nodes in AGE graph
+
+input:
+  mqtt:
+    urls:
+      - tcp://mosquitto:1883
+    topics:
+      - "buildings/+/agents/+/discovery"
+    client_id: "platform-discovery"
+    qos: 1
+    auto_replay_nacks: true
+
+pipeline:
+  processors:
+    - log:
+        level: INFO
+        message: "Received discovery: ${! this.devices.length() } devices from ${! this.building_id }/${! this.source_id }"
+
+    # Store context for flattening
+    - mapping: |
+        meta building_id = this.building_id
+        meta source_id = this.source_id
+        meta agent_id = this.agent_id
+        meta discovered_at = this.discovered_at
+        root = this.devices
+
+    # Flatten devices array
+    - unarchive:
+        format: json_array
+
+    # For each device, create device RawTag and object RawTags
+    - mapping: |
+        let device = this
+        let building = meta("building_id")
+        let source = meta("source_id")
+        let agent = meta("agent_id")
+        let disc_at = meta("discovered_at")
+
+        let device_tag = {
+          "id": "%s:%s:%s".format($building, $source, $device.device_id.string()),
+          "building_id": $building,
+          "source_id": $source,
+          "tag_type": "device",
+          "protocol": "bacnet",
+          "raw_data": $device.without("objects").string(),
+          "discovered_at": $disc_at,
+          "last_seen_by": $agent
+        }
+
+        let object_tags = this.objects.map_each(obj -> {
+          "id": "%s:%s:%s:%s:%s".format($building, $source, $device.device_id.string(), obj.object_type, obj.object_instance.string()),
+          "building_id": $building,
+          "source_id": $source,
+          "tag_type": "object",
+          "protocol": "bacnet",
+          "raw_data": obj.string(),
+          "discovered_at": $disc_at,
+          "last_seen_by": $agent
+        })
+
+        root = [$device_tag].concat($object_tags)
+
+    # Flatten to individual tags
+    - unarchive:
+        format: json_array
+
+    # Add timestamp
+    - mapping: |
+        root = this.merge({"last_seen_at": now()})
+
+    # Insert each RawTag via Cypher MERGE
+    - sql_raw:
+        driver: postgres
+        dsn: "postgres://postgres:postgres@postgres:5432/postgres?sslmode=disable"
+        init_statement: "SET search_path TO ag_catalog, public"
+        query: |
+          SELECT * FROM cypher('platform', $$
+            MERGE (t:RawTag {id: $id})
+            SET t.building_id = $building_id,
+                t.source_id = $source_id,
+                t.tag_type = $tag_type,
+                t.protocol = $protocol,
+                t.raw_data = $raw_data,
+                t.discovered_at = $discovered_at,
+                t.last_seen_by = $last_seen_by,
+                t.last_seen_at = $last_seen_at
+            RETURN t
+          $$, $1) AS (t agtype)
+        args_mapping: |
+          root = [this.format_json()]
+
+output:
+  drop: {}

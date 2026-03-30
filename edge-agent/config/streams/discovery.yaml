@@ -1,0 +1,55 @@
+# Discovery Stream - publishes device/object inventory to MQTT
+
+input:
+  generate:
+    interval: "${DISCOVERY_PUBLISH_INTERVAL:60s}"
+    count: 0
+    mapping: |
+      root = {}
+
+pipeline:
+  processors:
+    - sql_raw:
+        driver: sqlite
+        dsn: "file:/data/edge.db?mode=ro"
+        query: |
+          SELECT json_group_array(
+            json_object(
+              'device_id', d.device_id,
+              'address', d.address,
+              'name', d.name,
+              'vendor', d.vendor,
+              'model', d.model,
+              'discovered_at', d.discovered_at,
+              'last_seen_at', d.last_seen_at,
+              'objects', (
+                SELECT json_group_array(
+                  json_object(
+                    'object_type', o.object_type,
+                    'object_instance', o.object_instance,
+                    'object_name', o.object_name,
+                    'unit', o.unit
+                  )
+                )
+                FROM objects o WHERE o.device_id = d.device_id
+              )
+            )
+          ) as devices FROM devices d
+    - mapping: |
+        root.building_id = env("BUILDING_ID").or("bldg-001")
+        root.source_id = env("SOURCE_ID").or("default-bms")
+        root.agent_id = env("AGENT_ID").or("agent-001")
+        root.discovered_at = now()
+        root.devices = this.0.devices.parse_json()
+    - log:
+        level: INFO
+        message: "Publishing discovery: ${! this.devices.length() } devices"
+
+output:
+  mqtt:
+    urls:
+      - tcp://mosquitto:1883
+    topic: 'buildings/${! json("building_id") }/agents/${! json("agent_id") }/discovery'
+    qos: 1
+    retained: true
+    client_id: "edge-agent-discovery"

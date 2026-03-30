@@ -1,0 +1,49 @@
+# Uploader Stream - uploads readings from SQLite to MQTT
+
+input:
+  generate:
+    interval: "${UPLOAD_INTERVAL:5s}"
+    count: 0
+    mapping: |
+      root = {}
+
+pipeline:
+  processors:
+    - sql_raw:
+        driver: sqlite
+        dsn: "file:/data/edge.db"
+        query: "SELECT id, device_id, object_type, object_instance, value, status_flags, read_at FROM readings WHERE uploaded = 0 LIMIT 100"
+    - unarchive:
+        format: json_array
+    - switch:
+        - check: 'this == {}'
+          processors:
+            - mapping: 'root = deleted()'
+    - mapping: |
+        root.building_id = env("BUILDING_ID").or("bldg-001")
+        root.agent_id = env("AGENT_ID").or("agent-001")
+        root.device_id = this.device_id.string()
+        root.object_type = this.object_type
+        root.object_instance = this.object_instance
+        root.point_type = "unclassified"
+        root.value = this.value
+        root.unit = ""
+        root.status_flags = if this.status_flags != null && this.status_flags != "" { this.status_flags.parse_json() } else { null }
+        root.agent_read_at = this.read_at
+        meta reading_id = this.id
+
+output:
+  broker:
+    pattern: fan_out
+    outputs:
+      - mqtt:
+          urls:
+            - tcp://mosquitto:1883
+          topic: 'buildings/${! json("building_id") }/agents/${! json("agent_id") }/telemetry'
+          qos: 1
+          client_id: "edge-agent-uploader"
+      - sql_raw:
+          driver: sqlite
+          dsn: "file:/data/edge.db"
+          query: "UPDATE readings SET uploaded = 1 WHERE id = ?"
+          args_mapping: 'root = [meta("reading_id")]'

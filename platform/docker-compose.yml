@@ -81,14 +81,14 @@ services:
     restart: unless-stopped
 
   # ==========================================================================
-  # Stream Processing
+  # Stream Processing - Telemetry + Discovery (single process, multiple streams)
   # ==========================================================================
   bento:
     image: ghcr.io/warpstreamlabs/bento:latest
     container_name: evoiot-bento
     volumes:
-      - ./bento:/etc/bento:ro
-    command: ["-c", "/etc/bento/config.yml"]
+      - ./bento/streams:/streams:ro
+    command: ["streams", "/streams"]
     ports:
       - "4195:4195"
     networks:

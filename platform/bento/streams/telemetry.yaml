@@ -1,17 +1,5 @@
-# EvoIoT Platform - Bento Ingestion Pipeline (Step 3)
-# Subscribes to MQTT telemetry and writes to TimescaleDB
-
-http:
-  enabled: true
-  address: 0.0.0.0:4195
-
-metrics:
-  prometheus:
-    use_histogram_timing: true
-
-logger:
-  level: INFO
-  format: logfmt
+# Telemetry Stream - MQTT to TimescaleDB
+# Subscribes to telemetry topic and writes readings to TimescaleDB
 
 input:
   mqtt:
@@ -19,17 +7,12 @@ input:
       - tcp://mosquitto:1883
     topics:
       - "buildings/+/agents/+/telemetry"
-    client_id: "platform-ingestion"
+    client_id: "platform-telemetry"
     qos: 1
     auto_replay_nacks: true
 
 pipeline:
   processors:
-    # Parse the incoming message
-    - log:
-        level: DEBUG
-        message: "Received telemetry: ${! json() }"
-
     # Add metadata
     - mapping: |
         root = this
@@ -38,8 +21,6 @@ pipeline:
         root.scope = "device"
         root.confidence = 1.0
         root.created_at = now()
-
-        # Store raw payload
         root.raw_payload = this.string()
 
 output:
@@ -73,7 +54,6 @@ output:
         this.agent_read_at,
         this.confidence
       ]
-    init_statement: ""
     batching:
       count: 100
       period: 1s
