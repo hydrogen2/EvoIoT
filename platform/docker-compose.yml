@@ -114,7 +114,7 @@ services:
     volumes:
       - restate_data:/restate-data
     ports:
-      - "8080:8080"   # Ingress
+      - "8180:8080"   # Ingress
       - "9070:9070"   # Admin
       - "9081:9081"   # Metrics
     networks:
