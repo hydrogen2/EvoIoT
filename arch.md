@@ -87,8 +87,9 @@ Layer 1 — semantic layer (TBox + ABox)
     TBox: device type definitions, property schemas,
           relationship definitions, Brick mappings.
           Loaded from init YAML files at boot.
-    ABox: device instances, topology, classifications.
-          Populated by AI auto-classifier during onboarding.
+    ABox: device instances (RawTag), topology, classifications.
+          RawTags created at discovery; classifications added lazily
+          when user interacts with a tag (classify on read).
     Both live in Apache AGE (graph).
     │
     ▼
@@ -151,7 +152,7 @@ Platform ships with defaults seeded from YAML (`registered_by = 'platform'`):
 - Edge agent MQTT connection
 - Pre-built HTTP pipeline templates (weather, electricity rates, busyness)
 
-Users and AI register new sources by inserting rows. The platform fetches a sample response, stores it raw, then the AI classifier proposes a `point_type` and optional TBox entry — same classification loop as BACnet unknown objects. Human approves. Data becomes queryable immediately.
+Users and AI register new sources by inserting rows. The platform fetches a sample response and stores it raw. Classification happens lazily when the data is first used — AI proposes a `point_type` and optional TBox entry, human approves, then data becomes semantically queryable. Until then, data is still stored and accessible as unclassified.
 
 Context data property types live in the TBox alongside sensor types, with `source_type: context` to distinguish them. This makes them referenceable in rules, lens queries, and anomaly detection on equal footing with sensor data.
 
@@ -753,12 +754,18 @@ Verifiable: unclassified readings flowing from real BMS
             $$) AS (count agtype);
 ```
 
-**Step 5 — AI classifier**
-LiteLLM call with TBox context proposes classifications for unclassified devices and points. Proposals written to `classification_proposals` table. Minimal approval UI — human clicks approve, AGE graph nodes and IS_TYPE_OF edges created.
+**Step 5 — AI classifier (on-read)**
+Classification happens lazily — when a user first interacts with a RawTag (adds to dashboard, queries, etc.), the system triggers AI classification. LiteLLM call with TBox context proposes a classification. Proposal written to `classification_proposals` table. Human approves or rejects. On approval, IS_TYPE_OF edge links RawTag to TBox type.
+
+This "classify on read" approach means:
+- Points that are never used are never classified (saves LLM tokens)
+- Classification cost scales with actual usage, not discovery size
+- Aligns with "schema on read" philosophy — meaning applied when needed
 
 ```
-Verifiable: Device nodes in AGE graph after approval
-            classified readings queryable by point_type
+Verifiable: User adds RawTag to dashboard → classification proposal appears
+            Human approves → IS_TYPE_OF edge created in graph
+            Subsequent queries use cached classification
 ```
 
 **Step 6 — Building monitor app (basic)**
@@ -815,10 +822,11 @@ Verifiable: outdoor_temperature visible alongside sensor data
 ```
 
 **Step 13 — User-defined data sources**
-App UI to register a new HTTP data source. Bento watcher dynamically spawns pipeline. AI classifies new point type. Human approves. Custom data visible in app.
+App UI to register a new HTTP data source. Bento watcher dynamically spawns pipeline. Data flows immediately as unclassified. When user adds data to dashboard or queries it, AI classification triggers. Human approves. Custom data becomes semantically queryable.
 
 ```
-Verifiable: user registers API → data flows → AI classifies → approved
+Verifiable: user registers API → data flows (unclassified)
+            user adds to dashboard → AI proposes classification → approved
 ```
 
 **Step 14 — User-defined rules**
