@@ -878,31 +878,64 @@ Verifiable: unclassified readings flowing from real BMS
             $$) AS (count agtype);
 ```
 
-**Step 5 — AI classifier (intent-driven)**
-Classification is triggered by user intent, not by data discovery. When user requests a TBox type (e.g., adds "Zone Temperature" to dashboard), AI searches RawTags and proposes matches.
+**Step 5 — AI classifier (machinery)**
+Build the classifier as a reusable service. No triggers yet — just the machinery that can be invoked.
+
+Components:
+- **Classifier service** — takes (tbox_type, context) → searches RawTags → LLM scores candidates → returns ranked matches
+- **IS_TYPE_OF edges with status** — `status: 'proposed' | 'approved' | 'rejected'`, plus confidence, timestamps, approved_by
+- **Approval API** — POST to approve/reject proposals, updates edge status in graph
+
+```
+Classifier input:  { tbox_type: "SupplyAirTemp", building_id: "...", device_id: "..." }
+Classifier output: [ { rawtag_id: "...", confidence: 0.92, reason: "..." }, ... ]
+                          ↓
+                   Creates IS_TYPE_OF edge with status='proposed'
+                          ↓
+                   Human approves via API → status='approved'
+```
+
+All classification state lives in the graph (no separate proposals table):
+```cypher
+(r:RawTag)-[:IS_TYPE_OF {
+    status: "proposed",
+    confidence: 0.85,
+    proposed_at: timestamp,
+    approved_at: null,
+    approved_by: null
+}]->(p:PropertyDef)
+```
+
+```
+Verifiable: POST /classify { tbox_type: "ZoneTemp", device_id: "..." }
+            → IS_TYPE_OF edge created with status='proposed'
+            POST /classify/approve { edge_id: "..." }
+            → edge status='approved'
+```
+
+**Step 6 — Building monitor app (with classification triggers)**
+Next.js shell with predefined dashboard configs. Dashboard declares required TBox types. On access, triggers classification for any unclassified types.
+
+```
+Dashboard config (YAML):
+  name: "AHU Overview"
+  device_type: "AHU"
+  requires:
+    - SupplyAirTemp
+    - ReturnAirTemp
+    - FanStatus
+```
 
 Flow:
-1. User requests TBox type (via dashboard, query, rule)
-2. If TBox type doesn't exist, AI proposes adding it (from intent)
-3. AI searches RawTags for candidates matching the type
-4. AI proposes classification: "RawTag X looks like Zone Temperature"
-5. Human approves → IS_TYPE_OF edge created
-6. Data now flows through that TBox type
-
-This keeps TBox focused on user needs. Unused RawTags stay unclassified (dark) and don't pollute the system.
+1. User opens "AHU Overview" for AHU-1
+2. App checks: does AHU-1 have approved IS_TYPE_OF edges for each required type?
+3. Missing types → trigger classifier → show pending proposals
+4. User approves → data appears on dashboard
 
 ```
-Verifiable: User adds "Zone Temperature" to dashboard
-            → AI proposes: "analog-input:3 matches ZoneTemp"
-            → Human approves → IS_TYPE_OF edge created
-            → Dashboard shows live data
-```
-
-**Step 6 — Building monitor app (basic)**
-Next.js shell connects directly to PostgREST. Device list from graph. Live readings from TimescaleDB. No auth yet — single hardcoded building for development.
-
-```
-Verifiable: browser shows real device readings updating live
+Verifiable: Open dashboard for device with no classifications
+            → "3 data points need classification" prompt
+            → Approve proposals → dashboard shows live data
 ```
 
 **Step 7 — Auth**
