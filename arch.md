@@ -89,6 +89,40 @@ High Temp Alert                 →      ZoneTemp (reused)
 
 The seed is minimal, focused, and every type has a use case. The TBox grows organically as users ask new questions.
 
+**AI-guided discovery (helping users ask better questions):**
+
+Users can't ask for what they don't know exists. A dropdown of classified TBox types only shows what's been asked before — it doesn't help users discover what's meaningful.
+
+AI acts as a **domain consultant**, suggesting relevant questions based on building domain knowledge — not limited to existing data:
+
+```
+User: "I'm setting up monitoring for AHU-1"
+
+AI (domain expert): "For air handling units, you typically want:
+   ✓ Supply Air Temp      [data available]
+   ✓ Return Air Temp      [data available]
+   ○ Discharge Air Temp   [no data yet]
+   ○ Mixed Air Temp       [no data yet]
+   ✓ Fan Status           [data available]
+   ○ Filter Pressure      [no data yet]
+   ○ Cooling Valve Pos    [no data yet]
+
+   ✓ = classified data exists
+   ○ = no data source (add sensor? add integration?)"
+
+User selects "Filter Pressure"
+  → TBox type added (if missing)
+  → No RawTag matches → "Add a filter pressure sensor?"
+```
+
+This means:
+- **Suggestions draw from domain knowledge**, not just existing data
+- **Users learn the right questions** for their equipment type
+- **Gaps become visible** — "you should have X but don't"
+- **System grows toward completeness**, guided by domain best practices
+
+The AI helps users explore what's *meaningful*, not just what's *available*.
+
 ### Open ingestion layer
 Sensor data and external API data are unified — they differ only in how they arrive. The platform ships with defaults (MQTT for edge agent sensor data, pre-built pipeline templates for common APIs) but the ingestion layer is fully open: users and AI can register any data source via the `data_sources` registry. Bento dynamically spawns pipelines for new entries. All data flows through the same normalisation and classification loop regardless of origin.
 
