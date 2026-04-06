@@ -4,6 +4,32 @@
 
 A small, beautiful, AI-first IoT platform for building monitoring. Built from open source components assembled and configured rather than coded. The philosophy throughout: store everything raw, decide meaning later, let AI discover what matters, generate functionality on demand.
 
+**Question-first, not data-first:**
+
+```
+Traditional IoT:                  This platform:
+────────────────                  ──────────────
+Data sources → Schema → Apps      User asks questions (AI-guided)
+                                         ↓
+"Here's what we have,             TBox grows to match intent
+ figure out what to do"                  ↓
+                                  Data gaps identified
+                                         ↓
+                                  Fetch → Classify → Enable
+
+                                  "What do you want to know?
+                                   We'll figure out how to answer it."
+```
+
+The platform is:
+- **Question-first** — start with what you want to know, not what data exists
+- **AI-guided** — domain knowledge helps users ask the right questions
+- **Data fetcher** — acquires data needed to answer questions
+- **Classifier** — maps raw data to semantic meaning (TBox)
+- **Usage enabler** — wires answers into dashboards, rules, control
+
+Minimal seed apps + minimal seed TBox. Users grow the system by asking questions.
+
 **Target scenario (v1):** BACnet buildings, single-building monitor app, one customer deployment.
 
 ---
