@@ -28,11 +28,66 @@ Hardcode only the absolute floor: safety limits, auth, data ingestion, component
 ### AI as the learning engine
 The platform does not model the building — it learns the building. Schema, ontology, thresholds, and baselines are not designed upfront but grown continuously by AI from observation, ratified by humans.
 
-AI is responsible for: classifying new devices and data sources into TBox, proposing new TBox entries when it encounters novelty, calibrating rule thresholds from observed variance, learning normal behaviour per device per context, growing the ontology as the building reveals itself.
+AI is responsible for: extracting intent from user queries, proposing new TBox entries, classifying raw data to TBox types, calibrating rule thresholds from observed variance, learning normal behaviour per device per context.
 
 Humans are responsible for: approving or rejecting AI proposals, setting intent (what matters, what to act on), providing the floor (safety rules, compliance limits).
 
 The TBox is not a schema designed once — it is an accumulated record of everything the platform has learned about the buildings it has observed. Each new building onboarded potentially contributes new TBox entries. The platform gets smarter with every deployment.
+
+### Intent-driven TBox
+The TBox is driven by **user intent**, not by data availability. This keeps it focused and relevant.
+
+```
+TBox = what users WANT to know (demand)
+RawTags = what data EXISTS (supply)
+Classification = matching supply to demand
+```
+
+**TBox grows from intent, not data:**
+```
+User: "What's the outside temperature?"
+         │
+         ▼
+AI extracts intent → OUTSIDE_TEMP
+         │
+         ▼
+TBox has OUTSIDE_TEMP? ─── NO ───→ Propose new TBox type
+         │                                   │
+        YES                            Human approves
+         │                                   │
+         ▼                                   ▼
+Search RawTags for matches         TBox now has OUTSIDE_TEMP
+         │                                   │
+         └──────────────┬───────────────────┘
+                        ▼
+         Found candidates? ─── NO ───→ "No data. Add source?"
+                        │
+                       YES
+                        ▼
+         Propose classification → Human approves → Done
+```
+
+This means:
+- **TBox stays focused** — only types users actually need
+- **Raw data never pollutes TBox** — unclassified RawTags stay dark until needed
+- **Unfulfilled needs are visible** — TBox type with no data prompts "add data source"
+- **Unused data is fine** — RawTags without classification don't bloat the system
+
+**Seed TBox is entailed by predefined apps:**
+
+Rather than importing a generic ontology (Brick/Haystack), the seed TBox contains exactly the types needed by predefined dashboards, workflows, and rules:
+
+```
+Predefined Apps (starter kit)          Seed TBox (entailed)
+─────────────────────────────          ────────────────────
+Building Monitor Dashboard      →      ZoneTemp, SupplyAirTemp, Occupancy
+Energy Dashboard                →      ActivePower, EnergyConsumption
+Air Quality View                →      CO2Concentration, Humidity
+AHU Fault Workflow              →      AHUStatus, FaultCode
+High Temp Alert                 →      ZoneTemp (reused)
+```
+
+The seed is minimal, focused, and every type has a use case. The TBox grows organically as users ask new questions.
 
 ### Open ingestion layer
 Sensor data and external API data are unified — they differ only in how they arrive. The platform ships with defaults (MQTT for edge agent sensor data, pre-built pipeline templates for common APIs) but the ingestion layer is fully open: users and AI can register any data source via the `data_sources` registry. Bento dynamically spawns pipelines for new entries. All data flows through the same normalisation and classification loop regardless of origin.
@@ -719,20 +774,29 @@ Verifiable: docker compose up → all services healthy
 ```
 
 **Step 2 — TBox seed data**
-A single SQL migration file with Cypher INSERT statements for DeviceType, PropertyDef, RelationshipDef nodes and HAS_PROPERTY edges. No YAML, no service code — Postgres runs it automatically at boot via `/docker-entrypoint-initdb.d/`.
+Seed TBox contains exactly the types entailed by predefined apps — not a generic ontology import. A single SQL migration file with Cypher INSERT statements. Postgres runs it automatically at boot.
 
 ```
 postgres/initdb/
   02_tbox_seed.sql    Cypher INSERTs for TBox nodes and edges
-                      DeviceType: AHU, VAV, Chiller, Pump...
-                      PropertyDef: supply_air_temp, power_kw...
+
+                      Entailed by Building Monitor Dashboard:
+                        ZoneTemp, SupplyAirTemp, ReturnAirTemp, Occupancy
+                      Entailed by Energy Dashboard:
+                        ActivePower, EnergyConsumption, DemandPeak
+                      Entailed by Air Quality View:
+                        CO2Concentration, Humidity, OutsideAirTemp
+                      Entailed by predefined rules/workflows:
+                        AHUStatus, FaultCode, DamperPosition
+
+                      DeviceType nodes: AHU, VAV, Chiller...
                       RelationshipDef: serves, located_in...
                       HAS_PROPERTY edges linking types to properties
 
 Verifiable: SELECT * FROM cypher('platform', $$
-              MATCH (dt:DeviceType) RETURN dt
-            $$) AS (dt agtype);
-            → returns AHU, VAV, Chiller...
+              MATCH (p:PropertyDef) RETURN p.id
+            $$) AS (id agtype);
+            → returns ZoneTemp, SupplyAirTemp, CO2Concentration...
 ```
 
 **Step 3 — Edge agent skeleton with synthetic data**
@@ -754,18 +818,24 @@ Verifiable: unclassified readings flowing from real BMS
             $$) AS (count agtype);
 ```
 
-**Step 5 — AI classifier (on-read)**
-Classification happens lazily — when a user first interacts with a RawTag (adds to dashboard, queries, etc.), the system triggers AI classification. LiteLLM call with TBox context proposes a classification. Proposal written to `classification_proposals` table. Human approves or rejects. On approval, IS_TYPE_OF edge links RawTag to TBox type.
+**Step 5 — AI classifier (intent-driven)**
+Classification is triggered by user intent, not by data discovery. When user requests a TBox type (e.g., adds "Zone Temperature" to dashboard), AI searches RawTags and proposes matches.
 
-This "classify on read" approach means:
-- Points that are never used are never classified (saves LLM tokens)
-- Classification cost scales with actual usage, not discovery size
-- Aligns with "schema on read" philosophy — meaning applied when needed
+Flow:
+1. User requests TBox type (via dashboard, query, rule)
+2. If TBox type doesn't exist, AI proposes adding it (from intent)
+3. AI searches RawTags for candidates matching the type
+4. AI proposes classification: "RawTag X looks like Zone Temperature"
+5. Human approves → IS_TYPE_OF edge created
+6. Data now flows through that TBox type
+
+This keeps TBox focused on user needs. Unused RawTags stay unclassified (dark) and don't pollute the system.
 
 ```
-Verifiable: User adds RawTag to dashboard → classification proposal appears
-            Human approves → IS_TYPE_OF edge created in graph
-            Subsequent queries use cached classification
+Verifiable: User adds "Zone Temperature" to dashboard
+            → AI proposes: "analog-input:3 matches ZoneTemp"
+            → Human approves → IS_TYPE_OF edge created
+            → Dashboard shows live data
 ```
 
 **Step 6 — Building monitor app (basic)**
