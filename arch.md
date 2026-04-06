@@ -2,7 +2,9 @@
 
 ## Overview
 
-A small, beautiful, AI-first IoT platform for building monitoring. Built from open source components assembled and configured rather than coded. The philosophy throughout: store everything raw, decide meaning later, let AI discover what matters, generate functionality on demand.
+A small, beautiful, AI-first platform for real-time data and problem-solving. Built from open source components assembled and configured rather than coded. The philosophy throughout: store everything raw, decide meaning later, let AI discover what matters, generate functionality on demand.
+
+The architecture is **domain-agnostic** — a generic data↔AI platform. The v1 instantiation is building monitoring (BACnet/IoT), but the same patterns apply to any domain with real-time data, user questions, and AI-assisted reasoning.
 
 **Question-first, not data-first:**
 
@@ -52,13 +54,43 @@ AI changes what the platform can do, not just how you interact with it. Self-con
 Hardcode only the absolute floor: safety limits, auth, data ingestion, component primitives, audit trail. Let AI own the ceiling: classification, rules, screen assembly, query generation, anomaly detection.
 
 ### AI as the learning engine
-The platform does not model the building — it learns the building. Schema, ontology, thresholds, and baselines are not designed upfront but grown continuously by AI from observation, ratified by humans.
+The platform does not model the domain — it learns the domain. Schema, ontology, thresholds, and baselines are not designed upfront but grown continuously by AI from observation, ratified by humans.
 
-AI is responsible for: extracting intent from user queries, proposing new TBox entries, classifying raw data to TBox types, calibrating rule thresholds from observed variance, learning normal behaviour per device per context.
+AI is responsible for: extracting intent from user queries, proposing new TBox entries, classifying raw data to TBox types, calibrating rule thresholds from observed variance, learning normal behaviour per context.
 
 Humans are responsible for: approving or rejecting AI proposals, setting intent (what matters, what to act on), providing the floor (safety rules, compliance limits).
 
-The TBox is not a schema designed once — it is an accumulated record of everything the platform has learned about the buildings it has observed. Each new building onboarded potentially contributes new TBox entries. The platform gets smarter with every deployment.
+The TBox is not a schema designed once — it is an accumulated record of everything the platform has learned. Each new deployment potentially contributes new TBox entries. The platform gets smarter over time.
+
+### TBox as problem-solving ontology
+The TBox is a **problem-solving ontology**, not a data inventory.
+
+```
+Data inventory ontology:           Problem-solving ontology:
+(what we accidentally have)        (what questions matter)
+─────────────────────────          ────────────────────────
+"We have analog-input:3,           "To solve problems in this domain,
+ let's call it something"           you need to reason about X, Y, Z..."
+
+      ↓                                   ↓
+Ontology = catalog of              Ontology = domain concepts
+existing data sources              that enable reasoning
+      ↓                                   ↓
+Brittle, grows randomly,           Stable, grows deliberately,
+different per installation         shared across deployments
+```
+
+This is how real ontologies work:
+- **Brick Schema** — building concepts, independent of which sensors exist
+- **Schema.org** — web concepts, independent of which sites use them
+- **FHIR** — healthcare concepts, independent of which patients exist
+
+The TBox represents **the concepts needed to reason about and act in a domain**. Data sources come and go, but the problem-solving vocabulary is stable and shareable.
+
+This makes the platform **generic** — not tied to buildings or IoT. The v1 instantiation is building monitoring, but the same architecture applies to any domain where:
+- Real-time or near-real-time data flows in
+- Users need to ask questions, monitor, and act
+- AI can help map raw data to meaningful concepts
 
 ### Intent-driven TBox
 The TBox is driven by **user intent**, not by data availability. This keeps it focused and relevant.
