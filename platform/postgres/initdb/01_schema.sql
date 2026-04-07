@@ -461,9 +461,8 @@ BEGIN
 
     -- Get RawTag IDs that are classified to this TBox type
     v_sql := format(
-        $sql$SELECT array_agg(r_id) FROM (
-            SELECT (id #>> '{}')::TEXT AS r_id
-            FROM ag_catalog.cypher('platform', $cypher$
+        $sql$SELECT array_agg(id::text) FROM (
+            SELECT id FROM ag_catalog.cypher('platform', $cypher$
                 MATCH (r:RawTag {building_id: %L})-[e:IS_TYPE_OF {status: 'approved'}]->(p:PropertyDef {name: %L})
                 RETURN r.id AS id
             $cypher$) AS (id agtype)
@@ -472,7 +471,11 @@ BEGIN
     );
     EXECUTE v_sql INTO v_rawtag_ids;
 
-    -- Query readings by rawtag_id
+    -- Query readings by rawtag_id (handle NULL/empty array)
+    IF v_rawtag_ids IS NULL OR array_length(v_rawtag_ids, 1) IS NULL THEN
+        v_rawtag_ids := ARRAY[]::TEXT[];
+    END IF;
+
     SELECT jsonb_build_object(
         'status', 'ok',
         'tbox_type', p_tbox_type,
@@ -500,39 +503,221 @@ $$ LANGUAGE plpgsql VOLATILE SECURITY DEFINER;
 
 GRANT EXECUTE ON FUNCTION evoiot.get_readings_by_type TO postgrest_role, postgrest_anon, ai_reader, workflow_rw;
 
--- Function to create or update a RawTag node in the graph
--- Called during telemetry ingestion to ensure RawTag exists
-CREATE OR REPLACE FUNCTION evoiot.upsert_rawtag(
-    p_rawtag_id TEXT,
-    p_building_id TEXT,
-    p_device_id TEXT,
-    p_object_type TEXT,
-    p_object_instance TEXT,
-    p_object_name TEXT DEFAULT NULL
-) RETURNS void AS $$
+-- Function to compute rawtag_id from template and payload
+-- Template uses {field_name} syntax, e.g., "{building_id}:{source_id}:{device_id}:{object_type}:{object_instance}"
+CREATE OR REPLACE FUNCTION evoiot.compute_rawtag_id(
+    p_template TEXT,
+    p_payload JSONB
+) RETURNS TEXT AS $$
+DECLARE
+    v_result TEXT;
+    v_field TEXT;
+    v_value TEXT;
 BEGIN
-    -- MERGE creates if not exists, updates if exists
-    PERFORM ag_catalog.cypher('platform', format($cypher$
-        MERGE (r:RawTag {id: %L})
-        SET r.building_id = %L,
-            r.device_id = %L,
-            r.object_type = %L,
-            r.object_instance = %L,
-            r.object_name = %L,
-            r.updated_at = %L
-    $cypher$,
-        p_rawtag_id,
-        p_building_id,
-        p_device_id,
-        p_object_type,
-        p_object_instance,
-        COALESCE(p_object_name, ''),
-        extract(epoch from now())::bigint * 1000
-    ));
+    v_result := p_template;
+
+    -- Replace each {field} with the corresponding value from payload
+    FOR v_field IN SELECT (regexp_matches(p_template, '\{([^}]+)\}', 'g'))[1]
+    LOOP
+        v_value := p_payload ->> v_field;
+        IF v_value IS NULL THEN
+            v_value := '';
+        END IF;
+        v_result := regexp_replace(v_result, '\{' || v_field || '\}', v_value, 'g');
+    END LOOP;
+
+    RETURN v_result;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+-- Function to get rawtag_id template from data_sources
+-- Matches by building_id and source_type, falls back to global ('*')
+CREATE OR REPLACE FUNCTION evoiot.get_rawtag_template(
+    p_building_id TEXT,
+    p_source_type TEXT
+) RETURNS TEXT AS $$
+DECLARE
+    v_template TEXT;
+BEGIN
+    -- Try exact match first
+    SELECT rawtag_id_template INTO v_template
+    FROM evoiot.data_sources
+    WHERE building_id = p_building_id
+      AND source_type = p_source_type
+      AND rawtag_id_template IS NOT NULL
+      AND enabled = TRUE
+    LIMIT 1;
+
+    -- Fall back to global template
+    IF v_template IS NULL THEN
+        SELECT rawtag_id_template INTO v_template
+        FROM evoiot.data_sources
+        WHERE building_id = '*'
+          AND source_type = p_source_type
+          AND rawtag_id_template IS NOT NULL
+          AND enabled = TRUE
+        LIMIT 1;
+    END IF;
+
+    -- Default template for BACnet if nothing found
+    IF v_template IS NULL AND p_source_type = 'bacnet' THEN
+        v_template := '{building_id}:{source_id}:{device_id}:{object_type}:{object_instance}';
+    END IF;
+
+    RETURN v_template;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- Trigger function to compute rawtag_id on readings INSERT
+CREATE OR REPLACE FUNCTION evoiot.compute_rawtag_id_trigger() RETURNS TRIGGER AS $$
+DECLARE
+    v_template TEXT;
+    v_payload JSONB;
+    v_protocol TEXT;
+BEGIN
+    -- Only compute if rawtag_id is not already set
+    IF NEW.rawtag_id IS NULL AND NEW.raw_payload IS NOT NULL THEN
+        -- Parse raw_payload
+        IF jsonb_typeof(NEW.raw_payload) = 'string' THEN
+            BEGIN
+                v_payload := (NEW.raw_payload #>> '{}')::jsonb;
+            EXCEPTION WHEN OTHERS THEN
+                v_payload := NEW.raw_payload;
+            END;
+        ELSE
+            v_payload := NEW.raw_payload;
+        END IF;
+
+        -- Determine protocol from raw_payload indicators
+        -- BACnet: has object_type like 'analog-input', 'analog-output', etc.
+        IF v_payload ? 'object_type' AND (v_payload->>'object_type') LIKE '%-%' THEN
+            v_protocol := 'bacnet';
+        ELSE
+            v_protocol := 'bacnet';  -- Default to bacnet for now
+        END IF;
+
+        -- Get template based on building_id and detected protocol
+        v_template := evoiot.get_rawtag_template(NEW.building_id, v_protocol);
+
+        IF v_template IS NOT NULL THEN
+            -- Add source_id from agent_id if present
+            IF v_payload ? 'agent_id' THEN
+                v_payload := v_payload || jsonb_build_object('source_id', v_payload->>'agent_id');
+            END IF;
+
+            -- Add top-level reading fields to payload for template resolution
+            v_payload := v_payload || jsonb_build_object(
+                'building_id', NEW.building_id,
+                'device_id', NEW.device_id
+            );
+
+            NEW.rawtag_id := evoiot.compute_rawtag_id(v_template, v_payload);
+        END IF;
+    END IF;
+
+    RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
+-- Create trigger on readings table
+DROP TRIGGER IF EXISTS compute_rawtag_id_on_insert ON evoiot.readings;
+CREATE TRIGGER compute_rawtag_id_on_insert
+    BEFORE INSERT ON evoiot.readings
+    FOR EACH ROW
+    EXECUTE FUNCTION evoiot.compute_rawtag_id_trigger();
+
+-- Unified function to create or update a RawTag node in the graph
+-- Computes rawtag_id from externalized template in data_sources
+-- Handles both telemetry and discovery use cases
+CREATE OR REPLACE FUNCTION evoiot.upsert_rawtag(
+    p_building_id TEXT,
+    p_source_id TEXT,
+    p_device_id TEXT,
+    p_object_type TEXT DEFAULT NULL,
+    p_object_instance TEXT DEFAULT NULL,
+    p_protocol TEXT DEFAULT 'bacnet',
+    p_tag_type TEXT DEFAULT 'object',      -- 'device' or 'object'
+    p_raw_data TEXT DEFAULT NULL,
+    p_discovered_at TEXT DEFAULT NULL,
+    p_last_seen_by TEXT DEFAULT NULL
+) RETURNS TEXT AS $$
+DECLARE
+    v_template TEXT;
+    v_payload JSONB;
+    v_rawtag_id TEXT;
+BEGIN
+    -- Load AGE extension
+    EXECUTE 'LOAD ''age''';
+    EXECUTE 'SET search_path TO ag_catalog, evoiot, public';
+
+    -- Compute rawtag_id based on tag type
+    IF p_tag_type = 'device' THEN
+        -- Device tags: {building_id}:{source_id}:{device_id}
+        v_rawtag_id := p_building_id || ':' || p_source_id || ':' || p_device_id;
+    ELSE
+        -- Object tags: use template from data_sources
+        v_template := evoiot.get_rawtag_template(p_building_id, p_protocol);
+        IF v_template IS NOT NULL THEN
+            v_payload := jsonb_build_object(
+                'building_id', p_building_id,
+                'source_id', p_source_id,
+                'device_id', p_device_id,
+                'object_type', COALESCE(p_object_type, ''),
+                'object_instance', COALESCE(p_object_instance, '')
+            );
+            v_rawtag_id := evoiot.compute_rawtag_id(v_template, v_payload);
+        ELSE
+            -- Fallback to default format
+            v_rawtag_id := p_building_id || ':' || p_source_id || ':' || p_device_id || ':' || COALESCE(p_object_type, '') || ':' || COALESCE(p_object_instance, '');
+        END IF;
+    END IF;
+
+    -- MERGE creates if not exists, updates if exists (use EXECUTE for cypher)
+    -- Use CASE to preserve existing non-empty values for raw_data, discovered_at, last_seen_by
+    EXECUTE format($sql$
+        SELECT * FROM ag_catalog.cypher('platform', $cypher$
+            MERGE (r:RawTag {id: %L})
+            SET r.building_id = %L,
+                r.source_id = %L,
+                r.device_id = %L,
+                r.object_type = %L,
+                r.object_instance = %L,
+                r.protocol = %L,
+                r.tag_type = %L,
+                r.raw_data = CASE WHEN %L <> '' THEN %L ELSE COALESCE(r.raw_data, '') END,
+                r.discovered_at = CASE WHEN %L <> '' THEN %L ELSE COALESCE(r.discovered_at, '') END,
+                r.last_seen_by = CASE WHEN %L <> '' THEN %L ELSE COALESCE(r.last_seen_by, '') END,
+                r.updated_at = %L
+        $cypher$) AS (r agtype)
+    $sql$,
+        v_rawtag_id,
+        p_building_id,
+        p_source_id,
+        p_device_id,
+        COALESCE(p_object_type, ''),
+        COALESCE(p_object_instance, ''),
+        p_protocol,
+        p_tag_type,
+        COALESCE(p_raw_data, ''), COALESCE(p_raw_data, ''),
+        COALESCE(p_discovered_at, ''), COALESCE(p_discovered_at, ''),
+        COALESCE(p_last_seen_by, ''), COALESCE(p_last_seen_by, ''),
+        extract(epoch from now())::bigint * 1000
+    );
+
+    RETURN v_rawtag_id;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+GRANT EXECUTE ON FUNCTION evoiot.compute_rawtag_id TO bento_writer, workflow_rw, postgrest_anon;
+GRANT EXECUTE ON FUNCTION evoiot.get_rawtag_template TO bento_writer, workflow_rw, postgrest_anon;
 GRANT EXECUTE ON FUNCTION evoiot.upsert_rawtag TO bento_writer, workflow_rw;
+
+-- =============================================================================
+-- Seed Data Sources with RawTag ID Templates
+-- =============================================================================
+-- Global BACnet template - used as fallback for all buildings
+INSERT INTO evoiot.data_sources (building_id, name, source_type, rawtag_id_template, registered_by, classification)
+VALUES ('*', 'BACnet Default', 'bacnet', '{building_id}:{source_id}:{device_id}:{object_type}:{object_instance}', 'platform', 'classified');
 
 -- =============================================================================
 -- Seed Workflow Templates (platform defaults)

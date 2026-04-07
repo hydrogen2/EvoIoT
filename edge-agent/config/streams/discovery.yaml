@@ -37,8 +37,7 @@ pipeline:
           ) as devices FROM devices d
     - mapping: |
         root.building_id = env("BUILDING_ID").or("bldg-001")
-        root.source_id = env("SOURCE_ID").or("default-bms")
-        root.agent_id = env("AGENT_ID").or("agent-001")
+        root.source_id = env("AGENT_ID").or("agent-001")
         root.discovered_at = now()
         root.devices = this.0.devices.parse_json()
     - log:
@@ -49,7 +48,7 @@ output:
   mqtt:
     urls:
       - tcp://mosquitto:1883
-    topic: 'buildings/${! json("building_id") }/agents/${! json("agent_id") }/discovery'
+    topic: 'buildings/${! json("building_id") }/agents/${! json("source_id") }/discovery'
     qos: 1
     retained: true
     client_id: "edge-agent-discovery"

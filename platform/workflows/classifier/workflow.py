@@ -104,7 +104,9 @@ async def run(ctx: WorkflowContext, request: ClassifyRequest) -> dict:
 @classification_workflow.handler()
 async def get_proposals(ctx: WorkflowSharedContext) -> dict:
     """Get the current proposals pending review."""
-    return {"status": "use /classifier/{id}/review to submit decisions"}
+    # Query graph for proposals with status='proposed'
+    proposals = graph.get_pending_proposals()
+    return {"status": "pending_review", "proposals": proposals}
 
 
 @classification_workflow.handler()

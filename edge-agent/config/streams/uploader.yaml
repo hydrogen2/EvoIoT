@@ -21,7 +21,7 @@ pipeline:
             - mapping: 'root = deleted()'
     - mapping: |
         root.building_id = env("BUILDING_ID").or("bldg-001")
-        root.agent_id = env("AGENT_ID").or("agent-001")
+        root.source_id = env("AGENT_ID").or("agent-001")
         root.device_id = this.device_id.string()
         root.object_type = this.object_type
         root.object_instance = this.object_instance
@@ -39,7 +39,7 @@ output:
       - mqtt:
           urls:
             - tcp://mosquitto:1883
-          topic: 'buildings/${! json("building_id") }/agents/${! json("agent_id") }/telemetry'
+          topic: 'buildings/${! json("building_id") }/agents/${! json("source_id") }/telemetry'
           qos: 1
           client_id: "edge-agent-uploader"
       - sql_raw:

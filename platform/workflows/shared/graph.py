@@ -136,6 +136,33 @@ def create_is_type_of_edge(
     return results[0] if results else {}
 
 
+def get_pending_proposals() -> list[dict]:
+    """Get all IS_TYPE_OF edges that are not yet approved."""
+    query = """
+        MATCH (r:RawTag)-[e:IS_TYPE_OF]->(p:PropertyDef)
+        WHERE e.status IS NULL OR e.status = 'proposed'
+        RETURN r.id AS rawtag_id, p.name AS tbox_type, e.confidence AS confidence, e.reason AS reason, e.status AS status
+    """
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            sql = f"SELECT * FROM cypher('platform', $${query}$$) AS (rawtag_id agtype, tbox_type agtype, confidence agtype, reason agtype, status agtype)"
+            cur.execute(sql)
+            rows = cur.fetchall()
+            results = []
+            for row in rows:
+                results.append({
+                    "rawtag_id": str(row[0]).strip('"') if row[0] else None,
+                    "tbox_type": str(row[1]).strip('"') if row[1] else None,
+                    "confidence": float(row[2]) if row[2] else 0.0,
+                    "reason": str(row[3]).strip('"') if row[3] else "",
+                    "status": str(row[4]).strip('"') if row[4] else "proposed"
+                })
+            return results
+    finally:
+        conn.close()
+
+
 def update_is_type_of_status(
     rawtag_id: str,
     property_name: str,

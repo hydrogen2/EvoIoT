@@ -13,7 +13,7 @@ input:
 
 pipeline:
   processors:
-    # Add metadata and compute rawtag_id
+    # Add metadata - rawtag_id computed by PostgreSQL trigger using externalized template
     - mapping: |
         root = this
         root.id = uuid_v4()
@@ -22,15 +22,13 @@ pipeline:
         root.confidence = 1.0
         root.created_at = now()
         root.raw_payload = this.string()
-        # Compute rawtag_id from source fields (BACnet format)
-        # Format: bacnet:{building_id}:device-{device_id}:{object_type}:{object_instance}
-        root.rawtag_id = "bacnet:" + this.building_id + ":device-" + this.device_id + ":" + this.object_type + ":" + this.object_instance.string()
+        # rawtag_id computed by PostgreSQL trigger from data_sources.rawtag_id_template
 
 output:
   broker:
     pattern: fan_out
     outputs:
-      # Insert reading into TimescaleDB
+      # Insert reading into TimescaleDB (rawtag_id computed by trigger from template)
       - sql_insert:
           driver: postgres
           dsn: "postgres://bento_writer:bento_dev_password@postgres:5432/postgres?sslmode=disable"
@@ -41,7 +39,6 @@ output:
             - source_type
             - scope
             - device_id
-            - rawtag_id
             - point_type
             - value
             - unit
@@ -55,7 +52,6 @@ output:
               this.source_type,
               this.scope,
               this.device_id,
-              this.rawtag_id,
               this.point_type,
               this.value,
               this.unit,
@@ -66,17 +62,16 @@ output:
           batching:
             count: 100
             period: 1s
-      # Upsert RawTag in AGE graph (ensures node exists for classification)
+      # Upsert RawTag in AGE graph (rawtag_id computed from template internally)
       - sql_raw:
           driver: postgres
           dsn: "postgres://bento_writer:bento_dev_password@postgres:5432/postgres?sslmode=disable"
-          query: "SELECT evoiot.upsert_rawtag($1, $2, $3, $4, $5, $6)"
+          query: "SELECT evoiot.upsert_rawtag($1, $2, $3, $4, $5)"
           args_mapping: |
             root = [
-              this.rawtag_id,
               this.building_id,
+              this.source_id,
               this.device_id,
               this.object_type,
-              this.object_instance.string(),
-              ""
+              this.object_instance.string()
             ]

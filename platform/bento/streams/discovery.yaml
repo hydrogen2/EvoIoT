@@ -21,7 +21,6 @@ pipeline:
     - mapping: |
         meta building_id = this.building_id
         meta source_id = this.source_id
-        meta agent_id = this.agent_id
         meta discovered_at = this.discovered_at
         root = this.devices
 
@@ -30,33 +29,37 @@ pipeline:
         format: json_array
 
     # For each device, create device RawTag and object RawTags
+    # IDs are computed by PostgreSQL using externalized template from data_sources
     - mapping: |
         let device = this
         let building = meta("building_id")
         let source = meta("source_id")
-        let agent = meta("agent_id")
         let disc_at = meta("discovered_at")
 
         let device_tag = {
-          "id": "%s:%s:%s".format($building, $source, $device.device_id.string()),
           "building_id": $building,
           "source_id": $source,
           "tag_type": "device",
           "protocol": "bacnet",
+          "device_id": $device.device_id.string(),
+          "object_type": null,
+          "object_instance": null,
           "raw_data": $device.without("objects").string(),
           "discovered_at": $disc_at,
-          "last_seen_by": $agent
+          "last_seen_by": $source
         }
 
         let object_tags = this.objects.map_each(obj -> {
-          "id": "%s:%s:%s:%s:%s".format($building, $source, $device.device_id.string(), obj.object_type, obj.object_instance.string()),
           "building_id": $building,
           "source_id": $source,
           "tag_type": "object",
           "protocol": "bacnet",
+          "device_id": $device.device_id.string(),
+          "object_type": obj.object_type,
+          "object_instance": obj.object_instance.string(),
           "raw_data": obj.string(),
           "discovered_at": $disc_at,
-          "last_seen_by": $agent
+          "last_seen_by": $source
         })
 
         root = [$device_tag].concat($object_tags)
@@ -65,30 +68,24 @@ pipeline:
     - unarchive:
         format: json_array
 
-    # Add timestamp
-    - mapping: |
-        root = this.merge({"last_seen_at": now()})
-
-    # Insert each RawTag via Cypher MERGE
+    # Insert each RawTag via unified upsert function (computes ID from template)
     - sql_raw:
         driver: postgres
-        dsn: "postgres://postgres:postgres@postgres:5432/postgres?sslmode=disable"
-        init_statement: "SET search_path TO ag_catalog, public"
-        query: |
-          SELECT * FROM cypher('platform', $$
-            MERGE (t:RawTag {id: $id})
-            SET t.building_id = $building_id,
-                t.source_id = $source_id,
-                t.tag_type = $tag_type,
-                t.protocol = $protocol,
-                t.raw_data = $raw_data,
-                t.discovered_at = $discovered_at,
-                t.last_seen_by = $last_seen_by,
-                t.last_seen_at = $last_seen_at
-            RETURN t
-          $$, $1) AS (t agtype)
+        dsn: "postgres://bento_writer:bento_dev_password@postgres:5432/postgres?sslmode=disable"
+        query: "SELECT evoiot.upsert_rawtag($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
         args_mapping: |
-          root = [this.format_json()]
+          root = [
+            this.building_id,
+            this.source_id,
+            this.device_id,
+            this.object_type,
+            this.object_instance,
+            this.protocol,
+            this.tag_type,
+            this.raw_data,
+            this.discovered_at,
+            this.last_seen_by
+          ]
 
 output:
   drop: {}
