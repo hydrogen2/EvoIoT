@@ -414,23 +414,33 @@ DECLARE
     v_has_classification BOOLEAN;
     v_rawtag_ids TEXT[];
     v_result jsonb;
+    v_sql TEXT;
 BEGIN
+    -- Load AGE extension
+    EXECUTE 'LOAD ''age''';
+    EXECUTE 'SET search_path TO ag_catalog, evoiot, public';
+
     -- For dev/testing: hardcode building_id (Step 7 will use JWT claims)
     -- v_building_id := current_setting('request.jwt.claims', true)::jsonb->>'building_id';
     v_building_id := 'bldg-001';
 
     -- Check if any RawTag has approved IS_TYPE_OF edge to this TBox type
-    SELECT EXISTS (
-        SELECT 1 FROM ag_catalog.cypher('platform', format($cypher$
-            MATCH (r:RawTag {building_id: %L})-[e:IS_TYPE_OF {status: 'approved'}]->(p:PropertyDef {name: %L})
-            RETURN r.id LIMIT 1
-        $cypher$, v_building_id, p_tbox_type)) AS (id agtype)
-    ) INTO v_has_classification;
+    -- Use EXECUTE for dynamic cypher query (cypher() requires literal string)
+    v_sql := format(
+        $sql$SELECT EXISTS (
+            SELECT 1 FROM ag_catalog.cypher('platform', $cypher$
+                MATCH (r:RawTag {building_id: %L})-[e:IS_TYPE_OF {status: 'approved'}]->(p:PropertyDef {name: %L})
+                RETURN r.id LIMIT 1
+            $cypher$) AS (id agtype)
+        )$sql$,
+        v_building_id, p_tbox_type
+    );
+    EXECUTE v_sql INTO v_has_classification;
 
     -- If no classification, trigger classifier workflow (async via pg_net)
     IF NOT v_has_classification THEN
         PERFORM net.http_post(
-            url := 'http://restate:8180/classifier/' ||
+            url := 'http://restate:8080/classifier/' ||
                    encode(convert_to(v_building_id || ':' || p_tbox_type, 'UTF8'), 'base64') ||
                    '/run',
             body := jsonb_build_object(
@@ -450,14 +460,17 @@ BEGIN
     END IF;
 
     -- Get RawTag IDs that are classified to this TBox type
-    SELECT array_agg(r_id) INTO v_rawtag_ids
-    FROM (
-        SELECT (id #>> '{}')::TEXT AS r_id
-        FROM ag_catalog.cypher('platform', format($cypher$
-            MATCH (r:RawTag {building_id: %L})-[e:IS_TYPE_OF {status: 'approved'}]->(p:PropertyDef {name: %L})
-            RETURN r.id AS id
-        $cypher$, v_building_id, p_tbox_type)) AS (id agtype)
-    ) sub;
+    v_sql := format(
+        $sql$SELECT array_agg(r_id) FROM (
+            SELECT (id #>> '{}')::TEXT AS r_id
+            FROM ag_catalog.cypher('platform', $cypher$
+                MATCH (r:RawTag {building_id: %L})-[e:IS_TYPE_OF {status: 'approved'}]->(p:PropertyDef {name: %L})
+                RETURN r.id AS id
+            $cypher$) AS (id agtype)
+        ) sub$sql$,
+        v_building_id, p_tbox_type
+    );
+    EXECUTE v_sql INTO v_rawtag_ids;
 
     -- Query readings by rawtag_id
     SELECT jsonb_build_object(
@@ -483,7 +496,7 @@ BEGIN
 
     RETURN v_result;
 END;
-$$ LANGUAGE plpgsql STABLE SECURITY DEFINER;
+$$ LANGUAGE plpgsql VOLATILE SECURITY DEFINER;
 
 GRANT EXECUTE ON FUNCTION evoiot.get_readings_by_type TO postgrest_role, postgrest_anon, ai_reader, workflow_rw;
 
