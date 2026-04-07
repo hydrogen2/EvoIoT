@@ -910,39 +910,87 @@ Verifiable: unclassified readings flowing from real BMS
             $$) AS (count agtype);
 ```
 
-**Step 5 — AI classifier (machinery)**
-Build the classifier as a reusable service. No triggers yet — just the machinery that can be invoked.
+**Step 5 — AI classifier (workflow subsystem)**
+Classification requires human-in-the-loop (propose → review → rework → approve). Implemented as Restate workflow.
 
-Components:
-- **Classifier service** — takes (tbox_type, context) → searches RawTags → LLM scores candidates → returns ranked matches
-- **IS_TYPE_OF edges with status** — `status: 'proposed' | 'approved' | 'rejected'`, plus confidence, timestamps, approved_by
-- **Approval API** — POST to approve/reject proposals, updates edge status in graph
-
+**Architecture:**
 ```
-Classifier input:  { tbox_type: "SupplyAirTemp", building_id: "...", device_id: "..." }
-Classifier output: [ { rawtag_id: "...", confidence: 0.92, reason: "..." }, ... ]
-                          ↓
-                   Creates IS_TYPE_OF edge with status='proposed'
-                          ↓
-                   Human approves via API → status='approved'
+┌─────────────────────────────────────────────────────────────────┐
+│                    Workflow Subsystem                           │
+│                                                                 │
+│  Restate Server (Rust)       Workflows Service (Python)         │
+│  ┌──────────────────┐        ┌────────────────────────────────┐ │
+│  │ • Orchestration  │  HTTP  │ classifier/                    │ │
+│  │ • State/Journal  │◄──────►│   workflow.py                  │ │
+│  │ • Replay         │        │   prompts.py                   │ │
+│  │ • Awakeables     │        │ notifications/ (future)        │ │
+│  │                  │        │ shared/                        │ │
+│  │ "The brain"      │        │   llm.py (LiteLLM)             │ │
+│  └──────────────────┘        │   graph.py (Cypher)            │ │
+│                              │                                │ │
+│                              │ "The hands"                    │ │
+│                              └────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-All classification state lives in the graph (no separate proposals table):
+**Classify API (stateless, called by workflow):**
+```python
+async def classify(
+    rawtags: list[RawTag],
+    tbox_types: list[str],      # batch: ["SupplyAirTemp", "ReturnAirTemp", "FanStatus"]
+    context: dict,
+    feedback: str | None = None  # human comment for rework
+) -> dict[str, list[ScoredCandidate]]:
+    """
+    Match multiple TBox types against RawTags in one LLM call.
+    Feedback included when reworking after rejection.
+    Returns ranked candidates per type.
+    """
+```
+
+**Workflow flow:**
+```
+propose()
+  └─► classify(rawtags, tbox_types, context, feedback=None)
+        └─► create IS_TYPE_OF edges (status='proposed')
+
+await_review()
+  └─► human approves some, rejects others with comment
+
+rework()  (for rejected ones)
+  └─► classify(..., feedback="This is return air, not supply")
+        └─► LLM adjusts based on feedback
+              └─► update proposals
+
+finalize()
+  └─► approved edges: status='approved'
+      rejected edges: deleted or status='rejected'
+```
+
+**IS_TYPE_OF edges in graph (no separate proposals table):**
 ```cypher
 (r:RawTag)-[:IS_TYPE_OF {
-    status: "proposed",
+    status: "proposed",       -- or "approved" / "rejected"
     confidence: 0.85,
+    reason: "objectName contains 'SAT'",
     proposed_at: timestamp,
     approved_at: null,
-    approved_by: null
+    approved_by: null,
+    feedback: null            -- human comment if reworked
 }]->(p:PropertyDef)
 ```
 
+**Benefits of batch classify:**
+- One LLM call for all dashboard types (fewer calls)
+- LLM reasons about all types together (avoids duplicate assignments)
+- Better disambiguation ("3 temp sensors, 3 temp types" matched as set)
+
 ```
-Verifiable: POST /classify { tbox_type: "ZoneTemp", device_id: "..." }
-            → IS_TYPE_OF edge created with status='proposed'
-            POST /classify/approve { edge_id: "..." }
-            → edge status='approved'
+Verifiable: Trigger workflow for device with 3 required types
+            → 3 IS_TYPE_OF edges created (status='proposed')
+            → Human approves 2, rejects 1 with feedback
+            → Rework re-classifies rejected one
+            → All approved → dashboard shows data
 ```
 
 **Step 6 — Building monitor app (with classification triggers)**
