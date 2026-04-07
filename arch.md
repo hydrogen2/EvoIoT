@@ -334,13 +334,14 @@ Runtime lens configuration lives in Postgres, not in YAML at runtime. The YAML f
 
 **Classification-on-read (pg_net trigger)**
 
-The read API is by TBox type, not raw tags. When an app requests data for a TBox type, the platform checks if any RawTag is classified to that type. If not, it triggers the classifier workflow asynchronously.
+The read API is by TBox type, not raw tags. Building context comes from JWT claims (set by Zitadel Actions), not API parameters. When an app requests data for a TBox type, the platform checks if any RawTag is classified to that type. If not, it triggers the classifier workflow asynchronously.
 
 ```
-App: "Get zone_air_temp for building X"
+App: "Get zone_air_temp" (JWT has building_id claim)
               │
               ▼
     PostgREST RPC function
+    (extracts building_id from JWT)
               │
    ┌──────────┴──────────┐
    │                     │
@@ -361,28 +362,31 @@ Implementation uses pg_net extension for async HTTP from PL/pgSQL:
 
 ```sql
 CREATE FUNCTION get_readings_by_type(
-    p_building_id text,
     p_tbox_type text,
-    p_start timestamptz,
-    p_end timestamptz
+    p_start timestamptz DEFAULT now() - interval '1 hour',
+    p_end timestamptz DEFAULT now()
 ) RETURNS jsonb AS $$
 DECLARE
+    v_building_id text;
     has_classification boolean;
     result jsonb;
 BEGIN
+    -- Extract building_id from JWT claims (no business params in API)
+    v_building_id := current_setting('request.jwt.claims', true)::jsonb->>'building_id';
+
     -- Check if any RawTag is classified to this TBox type
     SELECT EXISTS (
         SELECT 1 FROM cypher('platform', format($$
             MATCH (r:RawTag {building_id: %L})-[:IS_TYPE_OF {status: 'approved'}]->(p:PropertyDef {name: %L})
             RETURN r LIMIT 1
-        $$, p_building_id, p_tbox_type)) AS (r agtype)
+        $$, v_building_id, p_tbox_type)) AS (r agtype)
     ) INTO has_classification;
 
     -- Trigger classifier if no classification exists (async, non-blocking)
     IF NOT has_classification THEN
         PERFORM net.http_post(
-            url := 'http://restate:8180/classifier/' || p_building_id || '-' || p_tbox_type || '/run',
-            body := jsonb_build_object('building_id', p_building_id, 'tbox_types', array[p_tbox_type])
+            url := 'http://restate:8180/classifier/' || v_building_id || '-' || p_tbox_type || '/run',
+            body := jsonb_build_object('building_id', v_building_id, 'tbox_types', array[p_tbox_type])
         );
     END IF;
 
@@ -397,7 +401,7 @@ END;
 $$ LANGUAGE plpgsql;
 ```
 
-Apps call one PostgREST endpoint, get data + classification status. No service layer needed.
+Apps call one PostgREST endpoint with JWT, get data + classification status. No service layer, no business params in API.
 
 ### v1 graph (current topology, no bitemporality)
 
@@ -1062,7 +1066,7 @@ Verifiable: Trigger workflow for device with 3 required types
 ```
 
 **Step 6 — Read data API with classification-on-read (pg_net)**
-PostgREST exposes a PL/pgSQL function that returns readings by TBox type. On access, automatically triggers classification if no RawTag is classified to the requested type.
+PostgREST exposes a PL/pgSQL function that returns readings by TBox type. Building context comes from JWT claims (injected by Zitadel Actions), not API parameters. On access, automatically triggers classification if no RawTag is classified to the requested type.
 
 ```sql
 -- Enable pg_net extension for async HTTP
@@ -1070,20 +1074,23 @@ CREATE EXTENSION IF NOT EXISTS pg_net;
 
 -- Read data API function (exposed via PostgREST)
 CREATE OR REPLACE FUNCTION get_readings_by_type(
-    p_building_id text,
     p_tbox_type text,
     p_start timestamptz DEFAULT now() - interval '1 hour',
     p_end timestamptz DEFAULT now()
 ) RETURNS jsonb AS $
 DECLARE
+    v_building_id text;
     has_classification boolean;
     rawtag_ids text[];
 BEGIN
+    -- Extract building_id from JWT claims (set by PostgREST from Authorization header)
+    v_building_id := current_setting('request.jwt.claims', true)::jsonb->>'building_id';
+
     -- Check if any RawTag is classified to this TBox type (approved)
     SELECT EXISTS (
         SELECT 1 FROM cypher('platform', $$
             MATCH (r:RawTag)-[e:IS_TYPE_OF]->(p:PropertyDef)
-            WHERE r.building_id = '$$ || p_building_id || $$'
+            WHERE r.building_id = '$$ || v_building_id || $$'
               AND p.name = '$$ || p_tbox_type || $$'
               AND e.status = 'approved'
             RETURN r.id
@@ -1094,9 +1101,9 @@ BEGIN
     IF NOT has_classification THEN
         PERFORM net.http_post(
             url := 'http://restate:8180/classifier/' ||
-                   encode(p_building_id || ':' || p_tbox_type, 'base64') || '/run',
+                   encode(v_building_id || ':' || p_tbox_type, 'base64') || '/run',
             body := jsonb_build_object(
-                'building_id', p_building_id,
+                'building_id', v_building_id,
                 'tbox_types', ARRAY[p_tbox_type]
             ),
             headers := '{"Content-Type": "application/json"}'::jsonb
@@ -1113,7 +1120,7 @@ BEGIN
     SELECT array_agg(id::text) INTO rawtag_ids
     FROM cypher('platform', $$
         MATCH (r:RawTag)-[e:IS_TYPE_OF]->(p:PropertyDef)
-        WHERE r.building_id = '$$ || p_building_id || $$'
+        WHERE r.building_id = '$$ || v_building_id || $$'
           AND p.name = '$$ || p_tbox_type || $$'
           AND e.status = 'approved'
         RETURN r.id
@@ -1140,13 +1147,14 @@ $ LANGUAGE plpgsql;
 ```
 
 Flow:
-1. Client calls `GET /rpc/get_readings_by_type?p_building_id=bldg-1&p_tbox_type=SupplyAirTemp`
-2. Function checks: any RawTag classified to SupplyAirTemp for this building?
-3. If no → pg_net fires async POST to Restate classifier → returns `classification_pending`
-4. Human approves proposals → next call returns actual readings
+1. Client calls `GET /rpc/get_readings_by_type?p_tbox_type=SupplyAirTemp` with JWT in Authorization header
+2. Function extracts building_id from JWT claims (no business params in API)
+3. Checks: any RawTag classified to SupplyAirTemp for this building?
+4. If no → pg_net fires async POST to Restate classifier → returns `classification_pending`
+5. Human approves proposals → next call returns actual readings
 
 ```
-Verifiable: Call PostgREST RPC for unconfigured building/type
+Verifiable: Call PostgREST RPC for unconfigured type (with valid JWT)
             → Returns {"status": "classification_pending"}
             → Classifier workflow started (check Restate UI)
             → Approve proposals
