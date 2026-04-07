@@ -332,6 +332,73 @@ Simulation results (EnergyPlus or simpler thermal model) are stored in Timescale
 **read_lens_config table**
 Runtime lens configuration lives in Postgres, not in YAML at runtime. The YAML file is the seed — loaded at boot into the table. Live changes (recalibration, new drift offsets) are made via PostgREST. The table is itself bitemporal (`valid_from`, `valid_to`) so historical queries automatically apply the correct calibration for the time period being queried.
 
+**Classification-on-read (pg_net trigger)**
+
+The read API is by TBox type, not raw tags. When an app requests data for a TBox type, the platform checks if any RawTag is classified to that type. If not, it triggers the classifier workflow asynchronously.
+
+```
+App: "Get zone_air_temp for building X"
+              │
+              ▼
+    PostgREST RPC function
+              │
+   ┌──────────┴──────────┐
+   │                     │
+   ▼                     ▼
+Check: any RawTag     Return data from
+with approved         classified RawTags
+IS_TYPE_OF edge       (with lens applied)
+to this type?
+   │
+   NO
+   │
+   ▼
+pg_net.http_post() → Restate classifier workflow
+(async, fire-and-forget)
+```
+
+Implementation uses pg_net extension for async HTTP from PL/pgSQL:
+
+```sql
+CREATE FUNCTION get_readings_by_type(
+    p_building_id text,
+    p_tbox_type text,
+    p_start timestamptz,
+    p_end timestamptz
+) RETURNS jsonb AS $$
+DECLARE
+    has_classification boolean;
+    result jsonb;
+BEGIN
+    -- Check if any RawTag is classified to this TBox type
+    SELECT EXISTS (
+        SELECT 1 FROM cypher('platform', format($$
+            MATCH (r:RawTag {building_id: %L})-[:IS_TYPE_OF {status: 'approved'}]->(p:PropertyDef {name: %L})
+            RETURN r LIMIT 1
+        $$, p_building_id, p_tbox_type)) AS (r agtype)
+    ) INTO has_classification;
+
+    -- Trigger classifier if no classification exists (async, non-blocking)
+    IF NOT has_classification THEN
+        PERFORM net.http_post(
+            url := 'http://restate:8180/classifier/' || p_building_id || '-' || p_tbox_type || '/run',
+            body := jsonb_build_object('building_id', p_building_id, 'tbox_types', array[p_tbox_type])
+        );
+    END IF;
+
+    -- Return data with lens applied (may be empty if no classification yet)
+    SELECT jsonb_build_object(
+        'data', COALESCE((SELECT jsonb_agg(...) FROM get_readings_with_lens(...)), '[]'::jsonb),
+        'classification_pending', NOT has_classification
+    ) INTO result;
+
+    RETURN result;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+Apps call one PostgREST endpoint, get data + classification status. No service layer needed.
+
 ### v1 graph (current topology, no bitemporality)
 
 The graph stores current state of the building topology. Nodes are devices, zones, floors, gateways. Edges are typed relationships (serves, located_in, connected_to, monitors). TBox type nodes are linked to ABox instance nodes via IS_TYPE_OF edges.
@@ -375,6 +442,7 @@ The tradeoff: AGE implements a subset of openCypher and is not as performant as 
 | Postgres 16 | Relational + audit + platform config | PostgreSQL |
 | TimescaleDB | Time-series extension | Apache 2 |
 | Apache AGE | Graph extension | Apache 2 |
+| pg_net | Async HTTP from PL/pgSQL | Apache 2 |
 | PostgREST | Zero-code REST over Postgres | MIT |
 | Mosquitto | MQTT broker | EPL/EDL |
 | Bento | Stream processing + pipelines | MIT (community fork) |
@@ -993,29 +1061,96 @@ Verifiable: Trigger workflow for device with 3 required types
             → All approved → dashboard shows data
 ```
 
-**Step 6 — Building monitor app (with classification triggers)**
-Next.js shell with predefined dashboard configs. Dashboard declares required TBox types. On access, triggers classification for any unclassified types.
+**Step 6 — Read data API with classification-on-read (pg_net)**
+PostgREST exposes a PL/pgSQL function that returns readings by TBox type. On access, automatically triggers classification if no RawTag is classified to the requested type.
 
-```
-Dashboard config (YAML):
-  name: "AHU Overview"
-  device_type: "AHU"
-  requires:
-    - SupplyAirTemp
-    - ReturnAirTemp
-    - FanStatus
+```sql
+-- Enable pg_net extension for async HTTP
+CREATE EXTENSION IF NOT EXISTS pg_net;
+
+-- Read data API function (exposed via PostgREST)
+CREATE OR REPLACE FUNCTION get_readings_by_type(
+    p_building_id text,
+    p_tbox_type text,
+    p_start timestamptz DEFAULT now() - interval '1 hour',
+    p_end timestamptz DEFAULT now()
+) RETURNS jsonb AS $
+DECLARE
+    has_classification boolean;
+    rawtag_ids text[];
+BEGIN
+    -- Check if any RawTag is classified to this TBox type (approved)
+    SELECT EXISTS (
+        SELECT 1 FROM cypher('platform', $$
+            MATCH (r:RawTag)-[e:IS_TYPE_OF]->(p:PropertyDef)
+            WHERE r.building_id = '$$ || p_building_id || $$'
+              AND p.name = '$$ || p_tbox_type || $$'
+              AND e.status = 'approved'
+            RETURN r.id
+        $$) AS (id agtype)
+    ) INTO has_classification;
+
+    -- Trigger classifier if no classification exists (async, non-blocking)
+    IF NOT has_classification THEN
+        PERFORM net.http_post(
+            url := 'http://restate:8180/classifier/' ||
+                   encode(p_building_id || ':' || p_tbox_type, 'base64') || '/run',
+            body := jsonb_build_object(
+                'building_id', p_building_id,
+                'tbox_types', ARRAY[p_tbox_type]
+            ),
+            headers := '{"Content-Type": "application/json"}'::jsonb
+        );
+
+        RETURN jsonb_build_object(
+            'status', 'classification_pending',
+            'message', 'No classification found for ' || p_tbox_type || '. Classifier triggered.',
+            'data', '[]'::jsonb
+        );
+    END IF;
+
+    -- Get classified RawTag IDs
+    SELECT array_agg(id::text) INTO rawtag_ids
+    FROM cypher('platform', $$
+        MATCH (r:RawTag)-[e:IS_TYPE_OF]->(p:PropertyDef)
+        WHERE r.building_id = '$$ || p_building_id || $$'
+          AND p.name = '$$ || p_tbox_type || $$'
+          AND e.status = 'approved'
+        RETURN r.id
+    $$) AS (id agtype);
+
+    -- Return readings from TimescaleDB
+    RETURN jsonb_build_object(
+        'status', 'ok',
+        'tbox_type', p_tbox_type,
+        'data', (
+            SELECT jsonb_agg(jsonb_build_object(
+                'time', time,
+                'value', value,
+                'rawtag_id', rawtag_id
+            ))
+            FROM readings
+            WHERE rawtag_id = ANY(rawtag_ids)
+              AND time BETWEEN p_start AND p_end
+            ORDER BY time DESC
+        )
+    );
+END;
+$ LANGUAGE plpgsql;
 ```
 
 Flow:
-1. User opens "AHU Overview" for AHU-1
-2. App checks: does AHU-1 have approved IS_TYPE_OF edges for each required type?
-3. Missing types → trigger classifier → show pending proposals
-4. User approves → data appears on dashboard
+1. Client calls `GET /rpc/get_readings_by_type?p_building_id=bldg-1&p_tbox_type=SupplyAirTemp`
+2. Function checks: any RawTag classified to SupplyAirTemp for this building?
+3. If no → pg_net fires async POST to Restate classifier → returns `classification_pending`
+4. Human approves proposals → next call returns actual readings
 
 ```
-Verifiable: Open dashboard for device with no classifications
-            → "3 data points need classification" prompt
-            → Approve proposals → dashboard shows live data
+Verifiable: Call PostgREST RPC for unconfigured building/type
+            → Returns {"status": "classification_pending"}
+            → Classifier workflow started (check Restate UI)
+            → Approve proposals
+            → Call again → Returns readings data
 ```
 
 **Step 7 — Auth**
