@@ -550,3 +550,9 @@ INSERT INTO evoiot.workflow_templates (name, handler_name, description, paramete
      '{"vendor": "string", "priority": "string", "budget_limit": "number"}'),
     ('inspection_round', 'InspectionRound', 'Scheduled inspection checklist workflow',
      '{"checklist_id": "uuid", "assignee_role": "string", "frequency": "string"}');
+
+-- =============================================================================
+-- PostgREST Schema Cache Reload
+-- =============================================================================
+-- Notify PostgREST to reload schema cache (useful when re-running this script)
+NOTIFY pgrst, 'reload schema';
