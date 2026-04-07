@@ -128,6 +128,36 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # Workflows Service (Python + Restate SDK)
+  workflows:
+    build: ./workflows
+    container_name: evoiot-workflows
+    networks:
+      - evoiot
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: evoiot
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      restate:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    labels:
+      # Restate will discover this service
+      - "restate.dev/service=workflows"
+
   # ==========================================================================
   # Identity Provider
   # ==========================================================================
