@@ -2,43 +2,16 @@
 
 from restate import Workflow, WorkflowContext, WorkflowSharedContext
 from pydantic import BaseModel
-from typing import Any
 
-from ..shared import graph, llm
+from shared import graph
+from shared.llm import classify_rawtags
 
 
 class ClassifyRequest(BaseModel):
     """Request to classify raw tags for a set of TBox types."""
     building_id: str
-    source_id: str | None = None  # Optional: filter to specific source
-    tbox_types: list[str]  # Property type names to classify
-
-
-class ProposalInfo(BaseModel):
-    """Info about a classification proposal."""
-    rawtag_id: str
-    tbox_type: str
-    confidence: float
-    reason: str
-    status: str = "proposed"
-
-
-class ReviewDecision(BaseModel):
-    """Human decision on a proposal."""
-    rawtag_id: str
-    tbox_type: str
-    approved: bool
-    feedback: str | None = None  # Comment for rework if rejected
-
-
-class ClassifyState(BaseModel):
-    """Workflow state."""
-    request: ClassifyRequest
-    proposals: list[ProposalInfo] = []
-    pending_review: list[ProposalInfo] = []
-    approved: list[ProposalInfo] = []
-    rejected: list[ProposalInfo] = []
-    rework_feedback: str | None = None
+    source_id: str | None = None
+    tbox_types: list[str]
 
 
 # Create the workflow
@@ -55,24 +28,25 @@ async def run(ctx: WorkflowContext, request: ClassifyRequest) -> dict:
     3. Create proposals in graph
     4. Wait for human review
     5. Handle approvals/rejections
-    6. Rework if needed
     """
-    state = ClassifyState(request=request)
-
-    # Step 1: Fetch data
-    rawtags = await ctx.run("fetch_rawtags", lambda: _fetch_rawtags(request))
-    property_defs = await ctx.run("fetch_property_defs", lambda: _fetch_property_defs(request.tbox_types))
+    # Step 1: Fetch data from graph
+    rawtags = await ctx.run(
+        "fetch_rawtags",
+        lambda: graph.get_rawtags_for_context(request.building_id, request.source_id)
+    )
 
     if not rawtags:
         return {"status": "error", "message": "No RawTags found for context"}
 
-    if not property_defs:
-        return {"status": "error", "message": "No PropertyDefs found for requested types"}
+    property_defs = await ctx.run(
+        "fetch_property_defs",
+        lambda: graph.get_property_defs(request.tbox_types)
+    )
 
     # Step 2: Classify with LLM
     classifications = await ctx.run(
         "classify",
-        lambda: _classify(rawtags, request.tbox_types, property_defs, state.rework_feedback)
+        lambda: classify_rawtags(rawtags, request.tbox_types, property_defs)
     )
 
     # Step 3: Create proposals in graph
@@ -80,137 +54,92 @@ async def run(ctx: WorkflowContext, request: ClassifyRequest) -> dict:
         "create_proposals",
         lambda: _create_proposals(classifications)
     )
-    state.proposals = proposals
-    state.pending_review = proposals.copy()
+
+    if not proposals:
+        return {
+            "status": "completed",
+            "message": "No classifications proposed by LLM",
+            "proposals": []
+        }
 
     # Step 4: Wait for human review
-    # This promise will be resolved by external call to /classifier/{workflow_id}/review
+    # Workflow suspends here until /classifier/{id}/review is called
     review_decisions = await ctx.promise("review").value()
 
     # Step 5: Process decisions
-    to_rework = []
-    feedback_parts = []
+    approved = []
+    rejected = []
 
     for decision in review_decisions:
-        proposal = next(
-            (p for p in state.pending_review
-             if p.rawtag_id == decision.rawtag_id and p.tbox_type == decision.tbox_type),
-            None
-        )
-        if not proposal:
-            continue
-
-        if decision.approved:
-            # Approve in graph
-            await ctx.run(
-                f"approve_{decision.tbox_type}",
-                lambda d=decision: _approve_proposal(d.rawtag_id, d.tbox_type, "workflow")
-            )
-            proposal.status = "approved"
-            state.approved.append(proposal)
-        else:
-            # Mark for rework
-            proposal.status = "rejected"
-            state.rejected.append(proposal)
-            to_rework.append(decision.tbox_type)
-            if decision.feedback:
-                feedback_parts.append(f"{decision.tbox_type}: {decision.feedback}")
-
-        state.pending_review = [p for p in state.pending_review if p != proposal]
-
-    # Step 6: Rework if needed
-    if to_rework and feedback_parts:
-        state.rework_feedback = "\n".join(feedback_parts)
-
-        # Re-classify with feedback
-        rework_classifications = await ctx.run(
-            "rework_classify",
-            lambda: _classify(rawtags, to_rework, property_defs, state.rework_feedback)
-        )
-
-        # Create new proposals
-        rework_proposals = await ctx.run(
-            "create_rework_proposals",
-            lambda: _create_proposals(rework_classifications)
-        )
-
-        state.pending_review.extend(rework_proposals)
-
-        # Wait for another review round
-        rework_decisions = await ctx.promise("rework_review").value()
-
-        for decision in rework_decisions:
-            if decision.approved:
+        matching = [p for p in proposals
+                   if p["rawtag_id"] == decision.get("rawtag_id")
+                   and p["tbox_type"] == decision.get("tbox_type")]
+        if matching:
+            proposal = matching[0]
+            if decision.get("approved"):
                 await ctx.run(
-                    f"approve_rework_{decision.tbox_type}",
-                    lambda d=decision: _approve_proposal(d.rawtag_id, d.tbox_type, "workflow")
+                    f"approve_{proposal['tbox_type']}",
+                    lambda p=proposal: graph.update_is_type_of_status(
+                        p["rawtag_id"], p["tbox_type"], "approved", "workflow"
+                    )
                 )
+                approved.append(proposal)
+            else:
+                await ctx.run(
+                    f"reject_{proposal['tbox_type']}",
+                    lambda p=proposal, d=decision: graph.update_is_type_of_status(
+                        p["rawtag_id"], p["tbox_type"], "rejected",
+                        feedback=d.get("feedback")
+                    )
+                )
+                rejected.append(proposal)
 
     return {
         "status": "completed",
-        "approved": [p.model_dump() for p in state.approved],
-        "rejected": [p.model_dump() for p in state.rejected]
+        "approved": approved,
+        "rejected": rejected
     }
 
 
 @classification_workflow.handler()
-async def get_state(ctx: WorkflowSharedContext) -> dict:
-    """Get the current workflow state (pending proposals, etc.)."""
-    # This is a read-only handler to check status
-    # In a real implementation, we'd store state in ctx and return it
+async def get_proposals(ctx: WorkflowSharedContext) -> dict:
+    """Get the current proposals pending review."""
     return {"status": "use /classifier/{id}/review to submit decisions"}
 
 
-# Helper functions (run inside ctx.run for journaling)
+@classification_workflow.handler()
+async def review(ctx: WorkflowSharedContext, decisions: list[dict]) -> dict:
+    """Submit review decisions to complete the workflow.
 
-async def _fetch_rawtags(request: ClassifyRequest) -> list[dict]:
-    """Fetch RawTags from graph."""
-    return await graph.get_rawtags_for_context(request.building_id, request.source_id)
-
-
-async def _fetch_property_defs(tbox_types: list[str]) -> list[dict]:
-    """Fetch PropertyDefs from graph."""
-    return await graph.get_property_defs(tbox_types)
-
-
-async def _classify(
-    rawtags: list[dict],
-    tbox_types: list[str],
-    property_defs: list[dict],
-    feedback: str | None
-) -> dict[str, llm.ClassificationResult]:
-    """Call LLM to classify."""
-    return await llm.classify_rawtags(rawtags, tbox_types, property_defs, feedback)
+    Args:
+        decisions: List of {rawtag_id, tbox_type, approved, feedback?}
+    """
+    await ctx.promise("review").resolve(decisions)
+    return {"status": "review submitted", "decisions": decisions}
 
 
-async def _create_proposals(classifications: dict[str, llm.ClassificationResult]) -> list[ProposalInfo]:
-    """Create proposal edges in graph."""
+# Helper functions (sync for ctx.run journaling)
+
+def _create_proposals(classifications: dict) -> list[dict]:
+    """Create proposal edges in graph for each classification."""
     proposals = []
     for tbox_type, result in classifications.items():
-        for candidate in result.candidates:
-            if candidate.rawtag_id:
-                await graph.create_is_type_of_edge(
-                    rawtag_id=candidate.rawtag_id,
+        for candidate in result.get("candidates", []):
+            rawtag_id = candidate.get("rawtag_id")
+            if rawtag_id:
+                # Create IS_TYPE_OF edge in graph with status=proposed
+                graph.create_is_type_of_edge(
+                    rawtag_id=rawtag_id,
                     property_name=tbox_type,
                     status="proposed",
-                    confidence=candidate.confidence,
-                    reason=candidate.reason
+                    confidence=candidate.get("confidence", 0.0),
+                    reason=candidate.get("reason", "")
                 )
-                proposals.append(ProposalInfo(
-                    rawtag_id=candidate.rawtag_id,
-                    tbox_type=tbox_type,
-                    confidence=candidate.confidence,
-                    reason=candidate.reason,
-                    status="proposed"
-                ))
+                proposals.append({
+                    "rawtag_id": rawtag_id,
+                    "tbox_type": tbox_type,
+                    "confidence": candidate.get("confidence", 0.0),
+                    "reason": candidate.get("reason", ""),
+                    "status": "proposed"
+                })
     return proposals
-
-
-async def _approve_proposal(rawtag_id: str, tbox_type: str, approved_by: str) -> None:
-    """Approve a proposal in graph."""
-    await graph.update_is_type_of_status(
-        rawtag_id=rawtag_id,
-        property_name=tbox_type,
-        status="approved",
-        approved_by=approved_by
-    )

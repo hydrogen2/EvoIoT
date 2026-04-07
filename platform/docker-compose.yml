@@ -109,7 +109,7 @@ services:
   # Workflow Engine
   # ==========================================================================
   restate:
-    image: restatedev/restate:1.1
+    image: restatedev/restate:1.4
     container_name: evoiot-restate
     volumes:
       - restate_data:/restate-data
@@ -137,12 +137,13 @@ services:
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
-      POSTGRES_DB: evoiot
+      POSTGRES_DB: postgres
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-      LLM_MODEL: ${LLM_MODEL:-gpt-4o}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Volcengine Doubao via LiteLLM (OpenAI-compatible)
+      LLM_MODEL: openai/doubao-seed-2.0-code
+      LLM_API_BASE: https://ark.cn-beijing.volces.com/api/coding/v3
+      LLM_API_KEY: REPLACE_WITH_LLM_API_KEY
     depends_on:
       postgres:
         condition: service_healthy

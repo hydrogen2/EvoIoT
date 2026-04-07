@@ -11,9 +11,10 @@ POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "postgres")
 
 POSTGRES_URL = f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
 
-# LLM
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o")
-LLM_API_KEY = os.getenv("LLM_API_KEY", "")  # Set via OPENAI_API_KEY or ANTHROPIC_API_KEY
+# LLM - Volcengine Doubao (OpenAI-compatible)
+LLM_MODEL = os.getenv("LLM_MODEL", "openai/doubao-seed-2.0-code")
+LLM_API_BASE = os.getenv("LLM_API_BASE", "https://ark.cn-beijing.volces.com/api/coding/v3")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 
 # Restate
 RESTATE_INGRESS_URL = os.getenv("RESTATE_INGRESS_URL", "http://restate:8080")

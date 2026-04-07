@@ -2,22 +2,7 @@
 
 import json
 import litellm
-from typing import Any
-from pydantic import BaseModel
-from .config import LLM_MODEL
-
-
-class ScoredCandidate(BaseModel):
-    """A RawTag candidate with classification score."""
-    rawtag_id: str
-    confidence: float  # 0.0 to 1.0
-    reason: str
-
-
-class ClassificationResult(BaseModel):
-    """Classification results for a single TBox type."""
-    tbox_type: str
-    candidates: list[ScoredCandidate]
+from .config import LLM_MODEL, LLM_API_BASE, LLM_API_KEY
 
 
 CLASSIFY_SYSTEM_PROMPT = """You are an expert at classifying building automation system (BAS) data points.
@@ -58,12 +43,12 @@ Example response:
 }}"""
 
 
-async def classify_rawtags(
+def classify_rawtags(
     rawtags: list[dict],
     tbox_types: list[str],
     property_defs: list[dict],
     feedback: str | None = None
-) -> dict[str, ClassificationResult]:
+) -> dict:
     """
     Classify raw tags against TBox property types using LLM.
 
@@ -74,13 +59,23 @@ async def classify_rawtags(
         feedback: Optional human feedback for rework
 
     Returns:
-        Dict mapping tbox_type -> ClassificationResult
+        Dict mapping tbox_type -> {candidates: [{rawtag_id, confidence, reason}]}
     """
+    if not rawtags or not tbox_types:
+        return {t: {"candidates": []} for t in tbox_types}
+
     # Format property types with their definitions
     prop_info = []
     for pdef in property_defs:
-        if pdef.get('name') in tbox_types:
-            prop_info.append(f"- {pdef.get('name')}: {pdef.get('label')} - {pdef.get('description')}")
+        name = pdef.get('name', '')
+        if name in tbox_types:
+            prop_info.append(f"- {name}: {pdef.get('label', '')} - {pdef.get('description', '')}")
+
+    # If we have no property definitions for requested types, still try
+    if not prop_info:
+        for t in tbox_types:
+            prop_info.append(f"- {t}")
+
     property_types_str = "\n".join(prop_info)
 
     # Format raw tags
@@ -100,38 +95,40 @@ Please reconsider your classifications based on this feedback."""
         feedback_section=feedback_section
     )
 
-    # Call LLM
-    response = await litellm.acompletion(
+    # Call LLM (some models don't support response_format)
+    response = litellm.completion(
         model=LLM_MODEL,
+        api_base=LLM_API_BASE if LLM_API_BASE else None,
+        api_key=LLM_API_KEY if LLM_API_KEY else None,
         messages=[
             {"role": "system", "content": CLASSIFY_SYSTEM_PROMPT},
             {"role": "user", "content": user_content}
-        ],
-        response_format={"type": "json_object"}
+        ]
     )
 
-    # Parse response
+    # Parse response - handle markdown code blocks
     content = response.choices[0].message.content
+    if "```json" in content:
+        content = content.split("```json")[1].split("```")[0].strip()
+    elif "```" in content:
+        content = content.split("```")[1].split("```")[0].strip()
+
     try:
         result_json = json.loads(content)
     except json.JSONDecodeError:
-        # If JSON parsing fails, return empty results
-        return {t: ClassificationResult(tbox_type=t, candidates=[]) for t in tbox_types}
+        return {t: {"candidates": []} for t in tbox_types}
 
-    # Convert to ClassificationResult objects
-    results: dict[str, ClassificationResult] = {}
+    # Convert to simple dict format
+    results: dict = {}
     for tbox_type in tbox_types:
         match = result_json.get(tbox_type, {})
         candidates = []
         if match.get("rawtag_id"):
-            candidates.append(ScoredCandidate(
-                rawtag_id=match["rawtag_id"],
-                confidence=match.get("confidence", 0.0),
-                reason=match.get("reason", "")
-            ))
-        results[tbox_type] = ClassificationResult(
-            tbox_type=tbox_type,
-            candidates=candidates
-        )
+            candidates.append({
+                "rawtag_id": match["rawtag_id"],
+                "confidence": match.get("confidence", 0.0),
+                "reason": match.get("reason", "")
+            })
+        results[tbox_type] = {"candidates": candidates}
 
     return results
