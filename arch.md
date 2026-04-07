@@ -403,6 +403,31 @@ $$ LANGUAGE plpgsql;
 
 Apps call one PostgREST endpoint with JWT, get data + classification status. No service layer, no business params in API.
 
+**RawTag ID linking (readings ↔ graph)**
+
+The link between time-series readings and graph RawTag nodes is the `rawtag_id` field. The ID derivation logic is externalized in `data_sources.rawtag_id_template` (Bloblang expression) — defined once per source type, used consistently for both RawTag creation and readings linking.
+
+```
+Write path (telemetry ingestion):
+  raw_payload → rawtag_id_template → rawtag_id → stored in readings.rawtag_id
+                                             → upsert RawTag node in graph
+
+Read path (get_readings_by_type):
+  TBox type → query graph for approved RawTag IDs → query readings by rawtag_id
+```
+
+Example templates per source type:
+```
+BACnet:  bacnet:${building_id}:device-${device_id}:${object_type}:${object_instance}
+Modbus:  modbus:${building_id}:slave-${slave_id}:reg-${register}
+MQTT:    mqtt:${building_id}:${topic_segment_2}:${topic_segment_3}
+```
+
+Benefits:
+- Single definition of ID format per source type (no duplication)
+- rawtag_id cached in readings at write time (no reconstruction at read time)
+- Clean join between readings table and graph via rawtag_id
+
 ### v1 graph (current topology, no bitemporality)
 
 The graph stores current state of the building topology. Nodes are devices, zones, floors, gateways. Edges are typed relationships (serves, located_in, connected_to, monitors). TBox type nodes are linked to ABox instance nodes via IS_TYPE_OF edges.
