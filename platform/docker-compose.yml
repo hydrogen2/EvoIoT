@@ -143,7 +143,7 @@ services:
       # Volcengine Doubao via LiteLLM (OpenAI-compatible)
       LLM_MODEL: openai/doubao-seed-2.0-code
       LLM_API_BASE: https://ark.cn-beijing.volces.com/api/coding/v3
-      LLM_API_KEY: REPLACE_WITH_LLM_API_KEY
+      LLM_API_KEY: ${LLM_API_KEY}
     depends_on:
       postgres:
         condition: service_healthy
