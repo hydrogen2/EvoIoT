@@ -25,49 +25,32 @@ pipeline:
         # rawtag_id computed by PostgreSQL trigger from data_sources.rawtag_id_template
 
 output:
-  broker:
-    pattern: fan_out
-    outputs:
-      # Insert reading into TimescaleDB (rawtag_id computed by trigger from template)
-      - sql_insert:
-          driver: postgres
-          dsn: "postgres://bento_writer:bento_dev_password@postgres:5432/postgres?sslmode=disable"
-          table: evoiot.readings
-          columns:
-            - id
-            - tenant_id
-            - source_type
-            - point_type
-            - value
-            - unit
-            - raw_payload
-            - observed_at
-            - confidence
-          args_mapping: |
-            root = [
-              this.id,
-              this.tenant_id,
-              this.source_type,
-              this.point_type,
-              this.value,
-              this.unit,
-              this.raw_payload,
-              this.agent_read_at,
-              this.confidence
-            ]
-          batching:
-            count: 100
-            period: 1s
-      # Upsert RawTag in AGE graph (rawtag_id computed from template internally)
-      - sql_raw:
-          driver: postgres
-          dsn: "postgres://bento_writer:bento_dev_password@postgres:5432/postgres?sslmode=disable"
-          query: "SELECT evoiot.upsert_rawtag($1, $2, $3, $4, $5)"
-          args_mapping: |
-            root = [
-              this.tenant_id,
-              this.source_id,
-              this.device_id,
-              this.object_type,
-              this.object_instance.string()
-            ]
+  sql_insert:
+    driver: postgres
+    dsn: "postgres://bento_writer:bento_dev_password@postgres:5432/postgres?sslmode=disable"
+    table: evoiot.readings
+    columns:
+      - id
+      - tenant_id
+      - source_type
+      - point_type
+      - value
+      - unit
+      - raw_payload
+      - observed_at
+      - confidence
+    args_mapping: |
+      root = [
+        this.id,
+        this.tenant_id,
+        this.source_type,
+        this.point_type,
+        this.value,
+        this.unit,
+        this.raw_payload,
+        this.agent_read_at,
+        this.confidence
+      ]
+    batching:
+      count: 100
+      period: 1s
