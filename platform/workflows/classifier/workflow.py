@@ -9,7 +9,7 @@ from shared.llm import classify_rawtags
 
 class ClassifyRequest(BaseModel):
     """Request to classify raw tags for a set of TBox types."""
-    building_id: str
+    tenant_id: str
     source_id: str | None = None
     tbox_types: list[str]
 
@@ -32,7 +32,7 @@ async def run(ctx: WorkflowContext, request: ClassifyRequest) -> dict:
     # Step 1: Fetch data from graph
     rawtags = await ctx.run(
         "fetch_rawtags",
-        lambda: graph.get_rawtags_for_context(request.building_id, request.source_id)
+        lambda: graph.get_rawtags_for_context(request.tenant_id, request.source_id)
     )
 
     if not rawtags:

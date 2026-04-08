@@ -15,7 +15,7 @@ import pytest
 from conftest import seed_rawtag, seed_readings
 
 TENANT = "test-e2e"
-TBOX_TYPE = "ZoneAirTemperatureSensor"
+TBOX_TYPE = "zone_air_temp"
 
 
 @pytest.fixture(scope="module")
@@ -46,7 +46,7 @@ def test_classification_on_read(seeded_data, api, restate):
     # ---------------------------------------------------------------
     # Step 1: First call — no classification exists, triggers workflow
     # ---------------------------------------------------------------
-    r = api.get("/rpc/get_readings_by_type", params={
+    r = api.post("/rpc/get_readings_by_type", json={
         "p_tbox_type": TBOX_TYPE,
         "p_tenant_id": TENANT,
     })
@@ -119,7 +119,7 @@ def test_classification_on_read(seeded_data, api, restate):
     # ---------------------------------------------------------------
     # Step 4: Second call — classification exists, returns readings
     # ---------------------------------------------------------------
-    r = api.get("/rpc/get_readings_by_type", params={
+    r = api.post("/rpc/get_readings_by_type", json={
         "p_tbox_type": TBOX_TYPE,
         "p_tenant_id": TENANT,
     })

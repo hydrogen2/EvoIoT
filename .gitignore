@@ -3,3 +3,4 @@ edge-agent/bacnet-simulator/
 # Environment files with secrets
 .env
 **/.env
+__pycache__/

@@ -24,14 +24,20 @@ import pytest
 # ---------------------------------------------------------------------------
 COMPOSE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../platform"))
 COMPOSE_FILE = os.path.join(COMPOSE_DIR, "docker-compose.yml")
+COMPOSE_OVERRIDE = os.path.join(os.path.dirname(__file__), "docker-compose.override.yml")
 
-POSTGRES_DSN = "host=localhost port=5432 dbname=postgres user=postgres password=postgres"
+POSTGRES_PORT = os.environ.get("POSTGRES_PORT", "15432")  # Use 15432 to avoid conflicts with local postgres
+POSTGRES_DSN = f"host=localhost port={POSTGRES_PORT} dbname=postgres user=postgres password=postgres"
 POSTGREST_URL = "http://localhost:3000"
 RESTATE_URL = "http://localhost:8180"
 
 # Core services needed for platform e2e tests (skip observability, exporters, etc.)
+# postgrest has no healthcheck tool in its minimal container, so we wait for it separately
 CORE_SERVICES = [
     "postgres", "postgrest", "mosquitto", "bento", "restate", "workflows",
+]
+WAIT_SERVICES = [
+    "postgres", "mosquitto", "bento", "restate", "workflows",
 ]
 
 def _find_docker():
@@ -52,7 +58,7 @@ DOCKER = _find_docker()
 
 
 def _compose(*args, check=True, timeout=120):
-    cmd = [DOCKER, "compose", "-f", COMPOSE_FILE] + list(args)
+    cmd = [DOCKER, "compose", "-f", COMPOSE_FILE, "-f", COMPOSE_OVERRIDE] + list(args)
     result = subprocess.run(cmd, cwd=COMPOSE_DIR, check=False, timeout=timeout,
                             capture_output=True, text=True)
     if check and result.returncode != 0:
@@ -83,28 +89,42 @@ def _wait_for_service(url, path="/", retries=30, interval=2):
 @pytest.fixture(scope="session", autouse=True)
 def stack():
     """Bring up a fresh platform stack, tear down after all tests."""
-    # Clean slate
-    _compose("down", "-v", check=False, timeout=60)
-    # Start only core services
-    _compose("up", "-d", "--wait", *CORE_SERVICES, timeout=300)
+    manage_stack = os.environ.get("E2E_MANAGE_STACK", "1") == "1"
 
-    # Extra wait for PostgREST and Restate to be fully ready
+    if manage_stack:
+        # Clean slate
+        _compose("down", "-v", check=False, timeout=60)
+        # Start core services
+        _compose("up", "-d", *CORE_SERVICES, timeout=120)
+
+    # Wait for services to be ready by polling HTTP endpoints
     _wait_for_service(POSTGREST_URL)
     _wait_for_service(RESTATE_URL, path="/restate/health")
 
     yield
 
-    # Tear down
-    _compose("down", "-v", check=False, timeout=60)
+    if manage_stack:
+        # Tear down
+        _compose("down", "-v", check=False, timeout=60)
 
 
 @pytest.fixture(scope="session")
 def db(stack):
     """Provide a psycopg2 connection to the platform database."""
-    conn = psycopg2.connect(POSTGRES_DSN)
-    conn.autocommit = True
-    yield conn
-    conn.close()
+    for attempt in range(30):
+        try:
+            conn = psycopg2.connect(POSTGRES_DSN)
+            conn.autocommit = True
+            return conn
+        except psycopg2.OperationalError:
+            time.sleep(2)
+    raise TimeoutError("Could not connect to PostgreSQL after 60s")
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _cleanup_db(db):
+    yield
+    db.close()
 
 
 @pytest.fixture(scope="session")
