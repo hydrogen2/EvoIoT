@@ -44,7 +44,7 @@ SELECT ag_catalog.create_graph('platform');
 -- Data Sources Registry
 CREATE TABLE evoiot.data_sources (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    building_id     TEXT NOT NULL,              -- '*' or specific uuid
+    tenant_id       TEXT NOT NULL,              -- '*' = global, or tenant identifier
     name            TEXT NOT NULL,
     source_type     TEXT NOT NULL,              -- 'mqtt' | 'http_poll' | 'webhook' | 'file' | 'bacnet' | 'modbus'
     config          JSONB,                      -- connection config (url, interval, headers)
@@ -60,50 +60,41 @@ CREATE TABLE evoiot.data_sources (
     CONSTRAINT valid_classification CHECK (classification IN ('classified', 'pending', 'rejected'))
 );
 
--- Readings (unified sensor + context data)
+-- Readings (unified time-series data)
 CREATE TABLE evoiot.readings (
     id              UUID DEFAULT gen_random_uuid(),
-    building_id     TEXT NOT NULL,              -- uuid or '*'
-    source_id       UUID REFERENCES evoiot.data_sources(id),
+    tenant_id       TEXT NOT NULL,              -- tenant identifier
     source_type     TEXT NOT NULL,              -- 'sensor' | 'api' | 'mqtt' | 'file'
-    scope           TEXT NOT NULL,              -- 'device' | 'building' | 'global'
-    device_id       TEXT,                       -- null for non-sensor sources
     rawtag_id       TEXT,                       -- computed from rawtag_id_template at ingestion
-    point_type      TEXT NOT NULL,              -- TBox type or 'unclassified'
+    point_type      TEXT NOT NULL,              -- ontology type or 'unclassified'
     value           DOUBLE PRECISION,
     unit            TEXT,
     raw_payload     JSONB,                      -- immutable original
-    agent_read_at   TIMESTAMPTZ NOT NULL,
+    observed_at     TIMESTAMPTZ NOT NULL,
     confidence      DOUBLE PRECISION DEFAULT 1.0,
     created_at      TIMESTAMPTZ DEFAULT NOW(),
-    PRIMARY KEY (id, agent_read_at),
-    CONSTRAINT valid_source_type CHECK (source_type IN ('sensor', 'api', 'mqtt', 'file', 'simulation')),
-    CONSTRAINT valid_scope CHECK (scope IN ('device', 'building', 'global'))
+    PRIMARY KEY (id, observed_at),
+    CONSTRAINT valid_source_type CHECK (source_type IN ('sensor', 'api', 'mqtt', 'file', 'simulation'))
 );
 
 -- Convert readings to TimescaleDB hypertable
-SELECT create_hypertable('evoiot.readings', 'agent_read_at');
+SELECT create_hypertable('evoiot.readings', 'observed_at');
 
--- Partial indexes for efficient queries
-CREATE INDEX readings_device_idx
-    ON evoiot.readings (device_id, point_type, agent_read_at DESC)
-    WHERE device_id IS NOT NULL;
-
-CREATE INDEX readings_context_idx
-    ON evoiot.readings (building_id, point_type, agent_read_at DESC)
-    WHERE device_id IS NULL;
-
-CREATE INDEX readings_building_time_idx
-    ON evoiot.readings (building_id, agent_read_at DESC);
+-- Indexes
+CREATE INDEX readings_tenant_time_idx
+    ON evoiot.readings (tenant_id, observed_at DESC);
 
 CREATE INDEX readings_rawtag_idx
-    ON evoiot.readings (rawtag_id, agent_read_at DESC)
+    ON evoiot.readings (rawtag_id, observed_at DESC)
     WHERE rawtag_id IS NOT NULL;
+
+CREATE INDEX readings_point_type_idx
+    ON evoiot.readings (point_type, observed_at DESC);
 
 -- Read Lens Configuration
 CREATE TABLE evoiot.read_lens_config (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    device_id       TEXT,
+    rawtag_id       TEXT,                         -- entity to apply lens to
     point_type      TEXT NOT NULL,
     drift_offset    DOUBLE PRECISION DEFAULT 0,
     confidence_factor DOUBLE PRECISION DEFAULT 1.0,
@@ -115,20 +106,20 @@ CREATE TABLE evoiot.read_lens_config (
 );
 
 CREATE INDEX read_lens_config_lookup_idx
-    ON evoiot.read_lens_config (device_id, point_type, valid_from DESC);
+    ON evoiot.read_lens_config (rawtag_id, point_type, valid_from DESC);
 
 -- Rules
 CREATE TABLE evoiot.rules (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    building_id     TEXT NOT NULL,              -- '*' = all buildings, uuid = one building
+    tenant_id       TEXT NOT NULL,              -- '*' = all tenants, or specific tenant
     source          TEXT NOT NULL,              -- 'platform' | 'user'
     name            TEXT NOT NULL,
     description     TEXT,
-    point_type      TEXT NOT NULL,              -- TBox property type
+    point_type      TEXT NOT NULL,              -- ontology type
     condition       TEXT NOT NULL,              -- "value > threshold"
     threshold       DOUBLE PRECISION,
     severity        TEXT NOT NULL,              -- 'P1' | 'P2' | 'P3'
-    device_id       TEXT NOT NULL,              -- '*' = all devices, uuid = one device
+    entity_id       TEXT NOT NULL,              -- '*' = all entities, or specific rawtag_id
     notify_user_ids UUID[],
     enabled         BOOLEAN DEFAULT TRUE,
     created_at      TIMESTAMPTZ DEFAULT NOW(),
@@ -138,15 +129,15 @@ CREATE TABLE evoiot.rules (
 );
 
 CREATE INDEX rules_evaluation_idx
-    ON evoiot.rules (building_id, point_type, enabled)
+    ON evoiot.rules (tenant_id, point_type, enabled)
     WHERE enabled = TRUE;
 
 -- Alerts (generated by rules engine)
 CREATE TABLE evoiot.alerts (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    building_id     TEXT NOT NULL,
+    tenant_id       TEXT NOT NULL,
     rule_id         UUID REFERENCES evoiot.rules(id),
-    device_id       UUID,
+    entity_id       TEXT,                       -- rawtag_id that triggered the alert
     point_type      TEXT NOT NULL,
     value           DOUBLE PRECISION,
     threshold       DOUBLE PRECISION,
@@ -160,8 +151,8 @@ CREATE TABLE evoiot.alerts (
     CONSTRAINT valid_status CHECK (status IN ('open', 'acknowledged', 'resolved'))
 );
 
-CREATE INDEX alerts_building_status_idx
-    ON evoiot.alerts (building_id, status, created_at DESC);
+CREATE INDEX alerts_tenant_status_idx
+    ON evoiot.alerts (tenant_id, status, created_at DESC);
 
 -- Workflow Templates
 CREATE TABLE evoiot.workflow_templates (
@@ -176,7 +167,7 @@ CREATE TABLE evoiot.workflow_templates (
 -- Workflow Configurations (operator-configured instances)
 CREATE TABLE evoiot.workflow_configs (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    building_id     TEXT NOT NULL,
+    tenant_id       TEXT NOT NULL,
     template_id     UUID REFERENCES evoiot.workflow_templates(id),
     name            TEXT NOT NULL,
     config          JSONB NOT NULL,             -- assignee_role, approver_role, sla_hours, etc.
@@ -186,8 +177,8 @@ CREATE TABLE evoiot.workflow_configs (
     updated_at      TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX workflow_configs_building_idx
-    ON evoiot.workflow_configs (building_id, enabled);
+CREATE INDEX workflow_configs_tenant_idx
+    ON evoiot.workflow_configs (tenant_id, enabled);
 
 -- Audit Log (append-only with hash chain)
 CREATE TABLE evoiot.audit_log (
@@ -221,8 +212,8 @@ ALTER TABLE evoiot.workflow_configs ENABLE ROW LEVEL SECURITY;
 CREATE POLICY readings_select_policy ON evoiot.readings
     FOR SELECT
     USING (
-        building_id = current_setting('request.jwt.claims', true)::json->>'building_id'
-        OR building_id = '*'
+        tenant_id = current_setting('request.jwt.claims', true)::json->>'tenant_id'
+        OR tenant_id = '*'
         OR current_setting('request.jwt.claims', true)::json->>'role' = 'admin'
     );
 
@@ -240,8 +231,8 @@ CREATE POLICY readings_anon_select ON evoiot.readings
 CREATE POLICY data_sources_select_policy ON evoiot.data_sources
     FOR SELECT
     USING (
-        building_id = current_setting('request.jwt.claims', true)::json->>'building_id'
-        OR building_id = '*'
+        tenant_id = current_setting('request.jwt.claims', true)::json->>'tenant_id'
+        OR tenant_id = '*'
         OR current_setting('request.jwt.claims', true)::json->>'role' = 'admin'
     );
 
@@ -249,8 +240,8 @@ CREATE POLICY data_sources_select_policy ON evoiot.data_sources
 CREATE POLICY rules_select_policy ON evoiot.rules
     FOR SELECT
     USING (
-        building_id = current_setting('request.jwt.claims', true)::json->>'building_id'
-        OR building_id = '*'
+        tenant_id = current_setting('request.jwt.claims', true)::json->>'tenant_id'
+        OR tenant_id = '*'
         OR current_setting('request.jwt.claims', true)::json->>'role' = 'admin'
     );
 
@@ -258,21 +249,21 @@ CREATE POLICY rules_insert_policy ON evoiot.rules
     FOR INSERT
     WITH CHECK (
         source = 'user'
-        AND building_id = current_setting('request.jwt.claims', true)::json->>'building_id'
+        AND tenant_id = current_setting('request.jwt.claims', true)::json->>'tenant_id'
     );
 
 CREATE POLICY rules_update_policy ON evoiot.rules
     FOR UPDATE
     USING (
         source = 'user'
-        AND building_id = current_setting('request.jwt.claims', true)::json->>'building_id'
+        AND tenant_id = current_setting('request.jwt.claims', true)::json->>'tenant_id'
     );
 
 -- RLS Policies: alerts
 CREATE POLICY alerts_select_policy ON evoiot.alerts
     FOR SELECT
     USING (
-        building_id = current_setting('request.jwt.claims', true)::json->>'building_id'
+        tenant_id = current_setting('request.jwt.claims', true)::json->>'tenant_id'
         OR current_setting('request.jwt.claims', true)::json->>'role' = 'admin'
     );
 
@@ -280,7 +271,7 @@ CREATE POLICY alerts_select_policy ON evoiot.alerts
 CREATE POLICY workflow_configs_select_policy ON evoiot.workflow_configs
     FOR SELECT
     USING (
-        building_id = current_setting('request.jwt.claims', true)::json->>'building_id'
+        tenant_id = current_setting('request.jwt.claims', true)::json->>'tenant_id'
         OR current_setting('request.jwt.claims', true)::json->>'role' = 'admin'
     );
 
@@ -338,7 +329,7 @@ REVOKE UPDATE, DELETE ON evoiot.audit_log FROM bento_writer, workflow_rw, edge_i
 
 -- Function to get readings with lens applied (gap fill, drift correction)
 CREATE OR REPLACE FUNCTION evoiot.get_readings_with_lens(
-    p_device_id UUID,
+    p_rawtag_id TEXT,
     p_point_type TEXT,
     p_start TIMESTAMPTZ,
     p_end TIMESTAMPTZ,
@@ -353,7 +344,7 @@ RETURNS TABLE (
 BEGIN
     RETURN QUERY
     SELECT
-        time_bucket_gapfill(p_interval, r.agent_read_at) AS bucket,
+        time_bucket_gapfill(p_interval, r.observed_at) AS bucket,
         interpolate(avg(r.value)) + COALESCE(lc.drift_offset, 0) AS value,
         CASE
             WHEN avg(r.value) IS NULL THEN 0.5
@@ -362,14 +353,14 @@ BEGIN
         avg(r.value) IS NULL AS is_interpolated
     FROM evoiot.readings r
     LEFT JOIN evoiot.read_lens_config lc
-        ON lc.device_id = r.device_id
+        ON lc.rawtag_id = r.rawtag_id
         AND lc.point_type = r.point_type
-        AND lc.valid_from <= r.agent_read_at
-        AND (lc.valid_to IS NULL OR lc.valid_to > r.agent_read_at)
-    WHERE r.device_id = p_device_id
+        AND lc.valid_from <= r.observed_at
+        AND (lc.valid_to IS NULL OR lc.valid_to > r.observed_at)
+    WHERE r.rawtag_id = p_rawtag_id
         AND r.point_type = p_point_type
-        AND r.agent_read_at BETWEEN p_start AND p_end
-    GROUP BY time_bucket_gapfill(p_interval, r.agent_read_at), lc.drift_offset, lc.confidence_factor
+        AND r.observed_at BETWEEN p_start AND p_end
+    GROUP BY time_bucket_gapfill(p_interval, r.observed_at), lc.drift_offset, lc.confidence_factor
     ORDER BY bucket;
 END;
 $$ LANGUAGE plpgsql STABLE;
@@ -377,14 +368,15 @@ $$ LANGUAGE plpgsql STABLE;
 -- Grant execute on functions
 GRANT EXECUTE ON FUNCTION evoiot.get_readings_with_lens TO postgrest_role, ai_reader, workflow_rw;
 
--- Function to get readings by TBox type with classification-on-read
+-- Function to get readings by ontology type with classification-on-read
 CREATE OR REPLACE FUNCTION evoiot.get_readings_by_type(
     p_tbox_type TEXT,
+    p_tenant_id TEXT DEFAULT null,
     p_start TIMESTAMPTZ DEFAULT now() - interval '1 hour',
     p_end TIMESTAMPTZ DEFAULT now()
 ) RETURNS jsonb AS $$
 DECLARE
-    v_building_id TEXT;
+    v_tenant_id TEXT;
     v_has_classification BOOLEAN;
     v_rawtag_ids TEXT[];
     v_result jsonb;
@@ -394,20 +386,20 @@ BEGIN
     EXECUTE 'LOAD ''age''';
     EXECUTE 'SET search_path TO ag_catalog, evoiot, public';
 
-    -- For dev/testing: hardcode building_id (Step 7 will use JWT claims)
-    -- v_building_id := current_setting('request.jwt.claims', true)::jsonb->>'building_id';
-    v_building_id := 'bldg-001';
+    -- Use provided tenant_id or extract from JWT
+    v_tenant_id := COALESCE(p_tenant_id,
+        current_setting('request.jwt.claims', true)::json->>'tenant_id',
+        'default');
 
-    -- Check if any RawTag has approved IS_TYPE_OF edge to this TBox type
-    -- Use EXECUTE for dynamic cypher query (cypher() requires literal string)
+    -- Check if any RawTag has approved IS_TYPE_OF edge to this type
     v_sql := format(
         $sql$SELECT EXISTS (
             SELECT 1 FROM ag_catalog.cypher('platform', $cypher$
-                MATCH (r:RawTag {building_id: %L})-[e:IS_TYPE_OF {status: 'approved'}]->(p:PropertyDef {name: %L})
+                MATCH (r:RawTag)-[e:IS_TYPE_OF {status: 'approved'}]->(p:PropertyDef {name: %L})
                 RETURN r.id LIMIT 1
             $cypher$) AS (id agtype)
         )$sql$,
-        v_building_id, p_tbox_type
+        p_tbox_type
     );
     EXECUTE v_sql INTO v_has_classification;
 
@@ -415,10 +407,10 @@ BEGIN
     IF NOT v_has_classification THEN
         PERFORM net.http_post(
             url := 'http://restate:8080/classifier/' ||
-                   encode(convert_to(v_building_id || ':' || p_tbox_type, 'UTF8'), 'base64') ||
+                   encode(convert_to(v_tenant_id || ':' || p_tbox_type, 'UTF8'), 'base64') ||
                    '/run',
             body := jsonb_build_object(
-                'building_id', v_building_id,
+                'tenant_id', v_tenant_id,
                 'tbox_types', ARRAY[p_tbox_type]
             ),
             headers := '{"Content-Type": "application/json"}'::jsonb
@@ -428,20 +420,20 @@ BEGIN
             'status', 'classification_pending',
             'message', 'No approved classification found for ' || p_tbox_type || '. Classifier workflow triggered.',
             'tbox_type', p_tbox_type,
-            'building_id', v_building_id,
+            'tenant_id', v_tenant_id,
             'data', '[]'::jsonb
         );
     END IF;
 
-    -- Get RawTag IDs that are classified to this TBox type
+    -- Get RawTag IDs that are classified to this type
     v_sql := format(
         $sql$SELECT array_agg(id::text) FROM (
             SELECT id FROM ag_catalog.cypher('platform', $cypher$
-                MATCH (r:RawTag {building_id: %L})-[e:IS_TYPE_OF {status: 'approved'}]->(p:PropertyDef {name: %L})
+                MATCH (r:RawTag)-[e:IS_TYPE_OF {status: 'approved'}]->(p:PropertyDef {name: %L})
                 RETURN r.id AS id
             $cypher$) AS (id agtype)
         ) sub$sql$,
-        v_building_id, p_tbox_type
+        p_tbox_type
     );
     EXECUTE v_sql INTO v_rawtag_ids;
 
@@ -453,19 +445,19 @@ BEGIN
     SELECT jsonb_build_object(
         'status', 'ok',
         'tbox_type', p_tbox_type,
-        'building_id', v_building_id,
+        'tenant_id', v_tenant_id,
         'rawtag_ids', to_jsonb(v_rawtag_ids),
         'data', COALESCE(
             (SELECT jsonb_agg(jsonb_build_object(
-                'time', r.agent_read_at,
+                'time', r.observed_at,
                 'value', r.value,
                 'unit', r.unit,
                 'rawtag_id', r.rawtag_id,
                 'confidence', r.confidence
-            ) ORDER BY r.agent_read_at DESC)
+            ) ORDER BY r.observed_at DESC)
             FROM evoiot.readings r
             WHERE r.rawtag_id = ANY(v_rawtag_ids)
-              AND r.agent_read_at BETWEEN p_start AND p_end
+              AND r.observed_at BETWEEN p_start AND p_end
             ),
             '[]'::jsonb
         )
@@ -478,7 +470,7 @@ $$ LANGUAGE plpgsql VOLATILE SECURITY DEFINER;
 GRANT EXECUTE ON FUNCTION evoiot.get_readings_by_type TO postgrest_role, postgrest_anon, ai_reader, workflow_rw;
 
 -- Function to compute rawtag_id from template and payload
--- Template uses {field_name} syntax, e.g., "{building_id}:{source_id}:{device_id}:{object_type}:{object_instance}"
+-- Template uses {field_name} syntax, e.g., "{tenant_id}:{source_id}:{device_id}:{object_type}:{object_instance}"
 CREATE OR REPLACE FUNCTION evoiot.compute_rawtag_id(
     p_template TEXT,
     p_payload JSONB
@@ -505,9 +497,9 @@ END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
 -- Function to get rawtag_id template from data_sources
--- Matches by building_id and source_type, falls back to global ('*')
+-- Matches by tenant_id and source_type, falls back to global ('*')
 CREATE OR REPLACE FUNCTION evoiot.get_rawtag_template(
-    p_building_id TEXT,
+    p_tenant_id TEXT,
     p_source_type TEXT
 ) RETURNS TEXT AS $$
 DECLARE
@@ -516,7 +508,7 @@ BEGIN
     -- Try exact match first
     SELECT rawtag_id_template INTO v_template
     FROM evoiot.data_sources
-    WHERE building_id = p_building_id
+    WHERE tenant_id = p_tenant_id
       AND source_type = p_source_type
       AND rawtag_id_template IS NOT NULL
       AND enabled = TRUE
@@ -526,7 +518,7 @@ BEGIN
     IF v_template IS NULL THEN
         SELECT rawtag_id_template INTO v_template
         FROM evoiot.data_sources
-        WHERE building_id = '*'
+        WHERE tenant_id = '*'
           AND source_type = p_source_type
           AND rawtag_id_template IS NOT NULL
           AND enabled = TRUE
@@ -535,7 +527,7 @@ BEGIN
 
     -- Default template for BACnet if nothing found
     IF v_template IS NULL AND p_source_type = 'bacnet' THEN
-        v_template := '{building_id}:{source_id}:{device_id}:{object_type}:{object_instance}';
+        v_template := '{tenant_id}:{source_id}:{device_id}:{object_type}:{object_instance}';
     END IF;
 
     RETURN v_template;
@@ -570,8 +562,8 @@ BEGIN
             v_protocol := 'bacnet';  -- Default to bacnet for now
         END IF;
 
-        -- Get template based on building_id and detected protocol
-        v_template := evoiot.get_rawtag_template(NEW.building_id, v_protocol);
+        -- Get template based on tenant_id and detected protocol
+        v_template := evoiot.get_rawtag_template(NEW.tenant_id, v_protocol);
 
         IF v_template IS NOT NULL THEN
             -- Add source_id from agent_id if present
@@ -579,10 +571,9 @@ BEGIN
                 v_payload := v_payload || jsonb_build_object('source_id', v_payload->>'agent_id');
             END IF;
 
-            -- Add top-level reading fields to payload for template resolution
+            -- Add tenant_id to payload for template resolution
             v_payload := v_payload || jsonb_build_object(
-                'building_id', NEW.building_id,
-                'device_id', NEW.device_id
+                'tenant_id', NEW.tenant_id
             );
 
             NEW.rawtag_id := evoiot.compute_rawtag_id(v_template, v_payload);
@@ -604,7 +595,7 @@ CREATE TRIGGER compute_rawtag_id_on_insert
 -- Computes rawtag_id from externalized template in data_sources
 -- Handles both telemetry and discovery use cases
 CREATE OR REPLACE FUNCTION evoiot.upsert_rawtag(
-    p_building_id TEXT,
+    p_tenant_id TEXT,
     p_source_id TEXT,
     p_device_id TEXT,
     p_object_type TEXT DEFAULT NULL,
@@ -626,14 +617,13 @@ BEGIN
 
     -- Compute rawtag_id based on tag type
     IF p_tag_type = 'device' THEN
-        -- Device tags: {building_id}:{source_id}:{device_id}
-        v_rawtag_id := p_building_id || ':' || p_source_id || ':' || p_device_id;
+        v_rawtag_id := p_tenant_id || ':' || p_source_id || ':' || p_device_id;
     ELSE
         -- Object tags: use template from data_sources
-        v_template := evoiot.get_rawtag_template(p_building_id, p_protocol);
+        v_template := evoiot.get_rawtag_template(p_tenant_id, p_protocol);
         IF v_template IS NOT NULL THEN
             v_payload := jsonb_build_object(
-                'building_id', p_building_id,
+                'tenant_id', p_tenant_id,
                 'source_id', p_source_id,
                 'device_id', p_device_id,
                 'object_type', COALESCE(p_object_type, ''),
@@ -642,7 +632,7 @@ BEGIN
             v_rawtag_id := evoiot.compute_rawtag_id(v_template, v_payload);
         ELSE
             -- Fallback to default format
-            v_rawtag_id := p_building_id || ':' || p_source_id || ':' || p_device_id || ':' || COALESCE(p_object_type, '') || ':' || COALESCE(p_object_instance, '');
+            v_rawtag_id := p_tenant_id || ':' || p_source_id || ':' || p_device_id || ':' || COALESCE(p_object_type, '') || ':' || COALESCE(p_object_instance, '');
         END IF;
     END IF;
 
@@ -665,7 +655,7 @@ BEGIN
         $cypher$) AS (r agtype)
     $sql$,
         v_rawtag_id,
-        p_building_id,
+        p_tenant_id,
         p_source_id,
         p_device_id,
         COALESCE(p_object_type, ''),
@@ -689,9 +679,9 @@ GRANT EXECUTE ON FUNCTION evoiot.upsert_rawtag TO bento_writer, workflow_rw;
 -- =============================================================================
 -- Seed Data Sources with RawTag ID Templates
 -- =============================================================================
--- Global BACnet template - used as fallback for all buildings
-INSERT INTO evoiot.data_sources (building_id, name, source_type, rawtag_id_template, registered_by, classification)
-VALUES ('*', 'BACnet Default', 'bacnet', '{building_id}:{source_id}:{device_id}:{object_type}:{object_instance}', 'platform', 'classified');
+-- Global BACnet template - used as fallback for all tenants
+INSERT INTO evoiot.data_sources (tenant_id, name, source_type, rawtag_id_template, registered_by, classification)
+VALUES ('*', 'BACnet Default', 'bacnet', '{tenant_id}:{source_id}:{device_id}:{object_type}:{object_instance}', 'platform', 'classified');
 
 -- =============================================================================
 -- Seed Workflow Templates (platform defaults)

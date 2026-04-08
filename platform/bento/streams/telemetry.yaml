@@ -18,7 +18,7 @@ pipeline:
         root = this
         root.id = uuid_v4()
         root.source_type = "sensor"
-        root.scope = "device"
+        root.tenant_id = this.building_id.or("default")
         root.confidence = 1.0
         root.created_at = now()
         root.raw_payload = this.string()
@@ -35,23 +35,19 @@ output:
           table: evoiot.readings
           columns:
             - id
-            - building_id
+            - tenant_id
             - source_type
-            - scope
-            - device_id
             - point_type
             - value
             - unit
             - raw_payload
-            - agent_read_at
+            - observed_at
             - confidence
           args_mapping: |
             root = [
               this.id,
-              this.building_id,
+              this.tenant_id,
               this.source_type,
-              this.scope,
-              this.device_id,
               this.point_type,
               this.value,
               this.unit,
@@ -69,7 +65,7 @@ output:
           query: "SELECT evoiot.upsert_rawtag($1, $2, $3, $4, $5)"
           args_mapping: |
             root = [
-              this.building_id,
+              this.tenant_id,
               this.source_id,
               this.device_id,
               this.object_type,
