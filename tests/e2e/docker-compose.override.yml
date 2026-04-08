@@ -1,5 +1,0 @@
-# Override ports for e2e tests to avoid conflicts with local services
-services:
-  postgres:
-    ports:
-      - "15432:5432"

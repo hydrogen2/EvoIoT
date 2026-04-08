@@ -24,9 +24,8 @@ import pytest
 # ---------------------------------------------------------------------------
 COMPOSE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../platform"))
 COMPOSE_FILE = os.path.join(COMPOSE_DIR, "docker-compose.yml")
-COMPOSE_OVERRIDE = os.path.join(os.path.dirname(__file__), "docker-compose.override.yml")
 
-POSTGRES_PORT = os.environ.get("POSTGRES_PORT", "15432")  # Use 15432 to avoid conflicts with local postgres
+POSTGRES_PORT = os.environ.get("POSTGRES_PORT", "5432")
 POSTGRES_DSN = f"host=localhost port={POSTGRES_PORT} dbname=postgres user=postgres password=postgres"
 POSTGREST_URL = "http://localhost:3000"
 RESTATE_URL = "http://localhost:8180"
@@ -58,7 +57,7 @@ DOCKER = _find_docker()
 
 
 def _compose(*args, check=True, timeout=120):
-    cmd = [DOCKER, "compose", "-f", COMPOSE_FILE, "-f", COMPOSE_OVERRIDE] + list(args)
+    cmd = [DOCKER, "compose", "-f", COMPOSE_FILE] + list(args)
     result = subprocess.run(cmd, cwd=COMPOSE_DIR, check=False, timeout=timeout,
                             capture_output=True, text=True)
     if check and result.returncode != 0:
@@ -70,12 +69,14 @@ def _compose(*args, check=True, timeout=120):
     return result
 
 
-def _wait_for_service(url, path="/", retries=30, interval=2):
+def _wait_for_service(url, path="/", retries=30, interval=2, expect_status=None):
     """Poll an HTTP endpoint until it responds."""
     for i in range(retries):
         try:
             r = httpx.get(f"{url}{path}", timeout=5)
-            if r.status_code < 500:
+            if expect_status and r.status_code == expect_status:
+                return
+            elif not expect_status and r.status_code < 500:
                 return
         except httpx.ConnectError:
             pass
@@ -94,12 +95,14 @@ def stack():
     if manage_stack:
         # Clean slate
         _compose("down", "-v", check=False, timeout=60)
-        # Start core services
-        _compose("up", "-d", *CORE_SERVICES, timeout=120)
+        # Start core services (--build ensures latest code)
+        _compose("up", "-d", "--build", *CORE_SERVICES, timeout=300)
 
     # Wait for services to be ready by polling HTTP endpoints
     _wait_for_service(POSTGREST_URL)
     _wait_for_service(RESTATE_URL, path="/restate/health")
+    # Wait for workflow service to register with Restate (admin API returns 200 when registered)
+    _wait_for_service("http://localhost:9070", path="/services/classifier", retries=30, expect_status=200)
 
     yield
 
