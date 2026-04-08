@@ -163,25 +163,6 @@ CREATE TABLE evoiot.alerts (
 CREATE INDEX alerts_building_status_idx
     ON evoiot.alerts (building_id, status, created_at DESC);
 
--- Classification Proposals (AI-generated)
-CREATE TABLE evoiot.classification_proposals (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    source_id       UUID REFERENCES evoiot.data_sources(id),
-    device_id       UUID,
-    raw_name        TEXT,
-    proposed_type   TEXT NOT NULL,              -- proposed TBox type
-    confidence      DOUBLE PRECISION,
-    reasoning       TEXT,
-    status          TEXT DEFAULT 'pending',     -- 'pending' | 'approved' | 'rejected'
-    reviewed_by     UUID,
-    reviewed_at     TIMESTAMPTZ,
-    created_at      TIMESTAMPTZ DEFAULT NOW(),
-    CONSTRAINT valid_status CHECK (status IN ('pending', 'approved', 'rejected'))
-);
-
-CREATE INDEX classification_proposals_status_idx
-    ON evoiot.classification_proposals (status, created_at DESC);
-
 -- Workflow Templates
 CREATE TABLE evoiot.workflow_templates (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -234,7 +215,6 @@ ALTER TABLE evoiot.readings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE evoiot.data_sources ENABLE ROW LEVEL SECURITY;
 ALTER TABLE evoiot.rules ENABLE ROW LEVEL SECURITY;
 ALTER TABLE evoiot.alerts ENABLE ROW LEVEL SECURITY;
-ALTER TABLE evoiot.classification_proposals ENABLE ROW LEVEL SECURITY;
 ALTER TABLE evoiot.workflow_configs ENABLE ROW LEVEL SECURITY;
 
 -- RLS Policies: readings
@@ -296,11 +276,6 @@ CREATE POLICY alerts_select_policy ON evoiot.alerts
         OR current_setting('request.jwt.claims', true)::json->>'role' = 'admin'
     );
 
--- RLS Policies: classification_proposals
-CREATE POLICY classification_proposals_select_policy ON evoiot.classification_proposals
-    FOR SELECT
-    USING (TRUE);  -- Admins only in production (simplified for dev)
-
 -- RLS Policies: workflow_configs
 CREATE POLICY workflow_configs_select_policy ON evoiot.workflow_configs
     FOR SELECT
@@ -340,7 +315,6 @@ GRANT USAGE ON ALL SEQUENCES IN SCHEMA evoiot TO edge_insert;
 
 -- ai_reader: SELECT all (scoped by RLS)
 GRANT SELECT ON ALL TABLES IN SCHEMA evoiot TO ai_reader;
-GRANT INSERT ON evoiot.classification_proposals TO ai_reader;
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA evoiot TO ai_reader;
 
 -- postgrest_role: SELECT/INSERT per RLS policy
