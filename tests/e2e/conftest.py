@@ -28,7 +28,8 @@ COMPOSE_FILE = os.path.join(COMPOSE_DIR, "docker-compose.yml")
 POSTGRES_PORT = os.environ.get("POSTGRES_PORT", "5432")
 POSTGRES_DSN = f"host=localhost port={POSTGRES_PORT} dbname=postgres user=postgres password=postgres"
 POSTGREST_URL = "http://localhost:3000"
-RESTATE_URL = "http://localhost:8180"
+RESTATE_INGRESS_URL = "http://localhost:8180"
+RESTATE_ADMIN_URL = "http://localhost:9070"
 
 # Core services needed for platform e2e tests (skip observability, exporters, etc.)
 # postgrest has no healthcheck tool in its minimal container, so we wait for it separately
@@ -100,9 +101,9 @@ def stack():
 
     # Wait for services to be ready by polling HTTP endpoints
     _wait_for_service(POSTGREST_URL)
-    _wait_for_service(RESTATE_URL, path="/restate/health")
+    _wait_for_service(RESTATE_INGRESS_URL, path="/restate/health")
     # Wait for workflow service to register with Restate (admin API returns 200 when registered)
-    _wait_for_service("http://localhost:9070", path="/services/classifier", retries=30, expect_status=200)
+    _wait_for_service(RESTATE_ADMIN_URL, path="/services/classifier", retries=30, expect_status=200)
 
     yield
 
@@ -140,7 +141,7 @@ def api(stack):
 @pytest.fixture(scope="session")
 def restate(stack):
     """Provide an httpx client for the Restate ingress API."""
-    with httpx.Client(base_url=RESTATE_URL, timeout=60) as client:
+    with httpx.Client(base_url=RESTATE_INGRESS_URL, timeout=60) as client:
         yield client
 
 
