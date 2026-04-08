@@ -34,13 +34,34 @@ CORE_SERVICES = [
     "postgres", "postgrest", "mosquitto", "bento", "restate", "workflows",
 ]
 
-DOCKER = os.environ.get("DOCKER", "docker")
+def _find_docker():
+    """Find docker executable, checking common Windows paths."""
+    docker = os.environ.get("DOCKER", "docker")
+    # Try common Docker Desktop paths on Windows
+    if os.name == "nt" and docker == "docker":
+        win_paths = [
+            r"C:\Program Files\Docker\Docker\resources\bin\docker.exe",
+            r"C:\Program Files\Docker\Docker\resources\docker.exe",
+        ]
+        for p in win_paths:
+            if os.path.isfile(p):
+                return p
+    return docker
+
+DOCKER = _find_docker()
 
 
 def _compose(*args, check=True, timeout=120):
     cmd = [DOCKER, "compose", "-f", COMPOSE_FILE] + list(args)
-    return subprocess.run(cmd, cwd=COMPOSE_DIR, check=check, timeout=timeout,
-                          capture_output=True, text=True)
+    result = subprocess.run(cmd, cwd=COMPOSE_DIR, check=False, timeout=timeout,
+                            capture_output=True, text=True)
+    if check and result.returncode != 0:
+        raise RuntimeError(
+            f"docker compose {' '.join(args)} failed (rc={result.returncode}):\n"
+            f"stdout: {result.stdout[-500:] if result.stdout else ''}\n"
+            f"stderr: {result.stderr[-500:] if result.stderr else ''}"
+        )
+    return result
 
 
 def _wait_for_service(url, path="/", retries=30, interval=2):
