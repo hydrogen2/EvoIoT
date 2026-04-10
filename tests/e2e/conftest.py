@@ -11,11 +11,13 @@ The fixtures manage the full docker compose lifecycle:
   - session end:   docker compose down -v
 """
 
+import json
 import os
 import subprocess
 import time
 
 import httpx
+import paho.mqtt.client as mqtt
 import psycopg2
 import pytest
 
@@ -30,14 +32,12 @@ POSTGRES_DSN = f"host=localhost port={POSTGRES_PORT} dbname=postgres user=postgr
 POSTGREST_URL = "http://localhost:3000"
 RESTATE_INGRESS_URL = "http://localhost:8180"
 RESTATE_ADMIN_URL = "http://localhost:9070"
+MQTT_HOST = os.environ.get("MQTT_HOST", "localhost")
+MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 
 # Core services needed for platform e2e tests (skip observability, exporters, etc.)
-# postgrest has no healthcheck tool in its minimal container, so we wait for it separately
 CORE_SERVICES = [
     "postgres", "postgrest", "mosquitto", "bento", "restate", "workflows",
-]
-WAIT_SERVICES = [
-    "postgres", "mosquitto", "bento", "restate", "workflows",
 ]
 
 def _find_docker():
@@ -145,24 +145,60 @@ def restate(stack):
         yield client
 
 
-def seed_rawtag(db, tenant_id, source_id, device_id, object_type, object_instance, raw_data):
-    """Create a RawTag node in the graph via upsert_rawtag()."""
-    with db.cursor() as cur:
-        cur.execute(
-            "SELECT evoiot.upsert_rawtag(%s, %s, %s, %s, %s, %s, %s, %s)",
-            (tenant_id, source_id, device_id, object_type, object_instance,
-             "bacnet", "object", raw_data),
-        )
-        return cur.fetchone()[0]
+@pytest.fixture(scope="session")
+def mqtt_client(stack):
+    """Provide a connected MQTT client."""
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="e2e-test")
+    client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
+    client.loop_start()
+    yield client
+    client.loop_stop()
+    client.disconnect()
 
 
-def seed_readings(db, tenant_id, rawtag_id, values):
-    """Insert test readings for a given rawtag_id."""
-    with db.cursor() as cur:
-        for val in values:
-            cur.execute(
-                """INSERT INTO evoiot.readings
-                   (tenant_id, source_type, rawtag_id, point_type, value, unit, observed_at)
-                   VALUES (%s, 'sensor', %s, 'unclassified', %s, 'degrees-celsius', now() - interval '%s seconds')""",
-                (tenant_id, rawtag_id, val["value"], val["age_seconds"]),
-            )
+# ---------------------------------------------------------------------------
+# MQTT seed helpers (data flows through Bento → Postgres)
+# ---------------------------------------------------------------------------
+def publish_discovery(mqtt_client, tenant_id, source_id, devices):
+    """Publish a discovery message to MQTT (triggers Bento discovery pipeline)."""
+    topic = f"buildings/{tenant_id}/agents/{source_id}/discovery"
+    payload = json.dumps({
+        "building_id": tenant_id,
+        "source_id": source_id,
+        "discovered_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "devices": devices,
+    })
+    mqtt_client.publish(topic, payload, qos=1)
+
+
+def publish_telemetry(mqtt_client, tenant_id, source_id, readings):
+    """Publish telemetry readings to MQTT (triggers Bento telemetry pipeline).
+
+    Each reading dict should have: value, unit, point_type, object_type, object_instance, device_id
+    """
+    topic = f"buildings/{tenant_id}/agents/{source_id}/telemetry"
+    for reading in readings:
+        payload = json.dumps({
+            "building_id": tenant_id,
+            "source_id": source_id,
+            "device_id": reading.get("device_id", "9001"),
+            "object_type": reading.get("object_type", "analog-value"),
+            "object_instance": reading.get("object_instance", "10"),
+            "point_type": reading.get("point_type", "unclassified"),
+            "value": reading["value"],
+            "unit": reading.get("unit", "degrees-celsius"),
+            "agent_read_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        })
+        mqtt_client.publish(topic, payload, qos=1)
+
+
+def wait_for_db_rows(db, query, params, min_count=1, retries=30, interval=2):
+    """Poll the database until a query returns at least min_count rows."""
+    for attempt in range(retries):
+        with db.cursor() as cur:
+            cur.execute(query, params)
+            rows = cur.fetchall()
+            if len(rows) >= min_count:
+                return rows
+        time.sleep(interval)
+    raise TimeoutError(f"Expected >= {min_count} rows after {retries * interval}s, got {len(rows)}")

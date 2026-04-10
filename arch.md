@@ -876,9 +876,7 @@ Platform + edge agent on same host. Single building. Transport: MQTT on localhos
 ## Security
 
 ### Audit log
-Postgres append-only table with hash chain. Application user has INSERT only — UPDATE and DELETE revoked. Each row's hash includes the previous row's hash (SHA256). Tamper detection: any modification breaks the chain. Covers all operational audit (who commanded what, when, outcome).
-
-Security-sensitive events (auth, permission changes, API key use) go to the same audit table but are additionally tagged `security: true` for compliance queries.
+Handled by the unified events table (see **Unified Events** section below). Application roles have INSERT only — UPDATE and DELETE revoked. Covers all operational audit (who commanded what, when, outcome). Security-sensitive events are tagged in the payload for compliance queries.
 
 ### Data backup
 **Two backup targets: Postgres + Restate volume.**
@@ -920,6 +918,151 @@ Loki + Promtail     auto-discovers all Docker containers
                     ships logs by container name label
                     30-day retention
 ```
+
+---
+
+## Unified Events
+
+### The insight
+
+Logging, tracing, provenance, and auditing are the same operation — recording what happened — viewed from different perspectives:
+
+```
+Filter by component/level    → ops logging      (for engineers)
+Filter by trace_id           → distributed trace (for debugging)
+Filter by data_id            → data provenance   (for customers)
+Filter by actor              → audit trail       (for compliance)
+```
+
+One event stream, one table, different query patterns. Design for the strictest requirements (audit: append-only, 100% capture, long retention) and the others come for free.
+
+```
+Logging  ⊂  Provenance  ⊂  Audit
+(weakest)   (middle)       (strictest)
+```
+
+### Data model
+
+```sql
+CREATE TABLE evoiot.events (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY,
+    timestamp   TIMESTAMPTZ DEFAULT now(),
+    component   TEXT NOT NULL,     -- bento.telemetry, restate.classifier, postgres
+    operation   TEXT NOT NULL,     -- mqtt_receive, sql_insert, llm_classify, human_approve
+    data_id     TEXT,              -- rawtag_id or reading.id (NULL = pure ops log)
+    trace_id    TEXT,              -- request-level correlation
+    actor       TEXT,              -- bento, doubao-v3, user@company.com
+    payload     JSONB,             -- context, flexible per operation
+    PRIMARY KEY (id)
+);
+```
+
+- **Append-only**: application roles granted INSERT only — no UPDATE, no DELETE
+- **data_id** is the key: if present, the event is provenance; if absent, it's a pure ops log
+- **No rigid event type enum**: operation is free-text, not a controlled vocabulary — avoids brittleness when adding new pipeline steps
+
+### Four chokepoints
+
+Inspired by NiFi's `ProcessSession` — a single root class that makes provenance emission unavoidable. Each layer of the platform has one chokepoint where all data must pass, ensuring no event goes unrecorded.
+
+**1. Bento — custom `pg_events` tracer plugin (global config)**
+
+A custom Bento binary wraps the standard Bento with a `pg_events` tracer plugin. The plugin implements the OTel `SpanExporter` interface and writes spans directly to `evoiot.events` via SQL — no protobuf, no bridge stream, no OTel Collector.
+
+```yaml
+# global.yaml — applies to ALL streams automatically
+tracer:
+  pg_events:
+    dsn: "postgres://bento_writer:...@postgres:5432/postgres"
+    keep_prefixes:
+      - "input_"
+      - "output_"
+```
+
+The tracer is built into the Bento binary via the official plugin API (`service.RegisterOtelTracerProvider`). Bento is imported as a Go dependency, not forked — upgrading is just a version bump in `go.mod`. Adding new streams automatically gets traced with zero per-stream configuration.
+
+The `keep_prefixes` filter ensures only input/output boundary events are recorded (not internal processor noise). The plugin can be extended to extract `data_id` from span attributes set via Bento's `meta` mechanism.
+
+**2. Restate — `traced_run` wrapper**
+
+Restate's `ctx.run()` is the single function all workflow steps must call. A thin wrapper makes event emission automatic:
+
+```python
+async def traced_run(ctx, name, fn):
+    result = await ctx.run(name, fn)
+    logger.info("step_completed", extra={
+        "workflow_id": ctx.key(),
+        "step": name,
+        "result_summary": _summarize(result),
+    })
+    return result
+```
+
+Replace `await ctx.run(...)` with `await traced_run(ctx, ...)` throughout workflows. Every step — LLM classification, proposal creation, human review — is logged with its workflow ID (which encodes the data correlation key). New workflow steps automatically get logged. No way to skip it.
+
+**3. PostgreSQL relational — `emit_event()` trigger function**
+
+One generic trigger function, attached to every relational table that matters:
+
+```sql
+CREATE FUNCTION evoiot.emit_event() RETURNS trigger AS $$
+BEGIN
+    INSERT INTO evoiot.events (component, operation, data_id, actor, payload)
+    VALUES (
+        'postgres',
+        TG_OP,
+        COALESCE(NEW.rawtag_id, NEW.id::text),
+        current_user,
+        jsonb_build_object('table', TG_TABLE_NAME, 'new', to_jsonb(NEW))
+    );
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+Attached to relational tables (readings, data_sources). Standard PostgreSQL triggers work here.
+
+**4. PostgreSQL graph — `execute_cypher()` wrapper**
+
+AGE bypasses the standard PostgreSQL executor for Cypher mutations (CREATE, MERGE, SET) — it writes directly to the heap via its C extension, so **standard PostgreSQL triggers do not fire** for Cypher operations. Instead, the chokepoint is `execute_cypher()` in `graph.py` — the single Python function through which all graph mutations flow:
+
+```python
+def execute_cypher(query: str) -> list[dict]:
+    """Execute a Cypher query, emit event, return results."""
+    # ... execute query ...
+    _emit_event(component="graph", operation=_classify_op(query),
+                data_id=_extract_id(query), payload={"cypher": query})
+    return results
+```
+
+Every graph operation — `create_is_type_of_edge`, `update_is_type_of_status`, `get_rawtags_for_context` — goes through this function. New graph operations automatically get logged.
+
+### Event flow architecture
+
+```
+Bento (branch+sql_raw) ──┐
+Restate (traced_run) ─────┤──→ evoiot.events table
+PG triggers (relational) ─┤          │
+PG functions (graph) ─────┘          │
+                          ┌──────────┼──────────┐
+                          ▼          ▼          ▼
+                      Grafana    Provenance    Alerts
+                     (ops logs)  (customer)   (quality)
+```
+
+### Provenance from the data's perspective
+
+For any data point, a customer can see its full story by querying `WHERE data_id = 'rawtag-xxx' ORDER BY timestamp`:
+
+```
+1. Source  — device 9001, protocol BACnet, object analog-value:10, received at T₁
+2. Raw     — {"object_name": "floor1_zone_air_temperature", "unit": "degrees-celsius"}
+3. Classify — LLM proposed zone_air_temp, confidence 92%, model doubao-v3, at T₂
+4. Review  — approved by user@company.com at T₃
+5. Serve   — reading 22.5°C included in zone_air_temp query at T₄
+```
+
+Every step has a who, what, when, and why. No gaps.
 
 ---
 
@@ -1186,7 +1329,27 @@ Verifiable: Call PostgREST RPC for unconfigured type (with valid JWT)
             → Call again → Returns readings data
 ```
 
-**Step 7 — Auth**
+**Step 7 — Unified events (provenance / logging / audit)**
+Four chokepoints emit events into a single `evoiot.events` table. E2E test seeds data via MQTT (not direct DB insert) so the full Bento → Postgres → Restate → Postgres chain is exercised and every step is recorded.
+
+```
+Implementation:
+  1. events table + emit_event() trigger on relational tables (readings, data_sources)
+  2. upsert_rawtag() emits graph mutation events
+  3. execute_cypher() wrapper emits graph mutation events
+  4. traced_run() wrapper for Restate ctx.run()
+  5. Bento branch+sql_raw processor emits mqtt_receive events
+  6. E2E test: seed via MQTT, verify provenance chain in events table
+
+Verifiable: run classification-on-read e2e test
+            → query events WHERE data_id = rawtag_id ORDER BY timestamp
+            → full chain: mqtt_receive → rawtag_upsert → reading_insert
+              → workflow_start → llm_classify → proposal_create
+              → human_approve → status_update
+            → no gaps
+```
+
+**Step 8 — Auth**
 JWT flow wired. PostgREST validates tokens. RLS enforces building isolation. Zitadel Actions inject building_id claim. MQTT ACL enabled.
 
 ```
@@ -1194,7 +1357,7 @@ Verifiable: login required
             user from building A cannot see building B data
 ```
 
-**Step 8 — Read lens**
+**Step 9 — Read lens**
 Postgres functions for gap fill, drift correction, confidence scoring. `read_lens_config` seeded with defaults. PostgREST exposes lens functions as RPC. App switches from raw to lens-filtered readings.
 
 ```
@@ -1202,21 +1365,21 @@ Verifiable: sensor gap shows interpolated values with lower confidence
             drift offset applied transparently
 ```
 
-**Step 9 — Rules engine**
+**Step 10 — Rules engine**
 Platform default rules seeded. Bento scheduled pipeline evaluates `rules` table every 5 minutes against TimescaleDB. Alerts written to `alerts` table. App shows alert list.
 
 ```
 Verifiable: set sensor above threshold → alert appears in UI
 ```
 
-**Step 10 — Command dispatch**
+**Step 11 — Command dispatch**
 Restate CommandObject workflow. Paho publishes to edge agent via Mosquitto. Edge agent executes BACnet WriteProperty. Ack returns via Bento → Restate awakeable. App sends setpoint command.
 
 ```
 Verifiable: UI sends command → physical device changes → ack recorded
 ```
 
-**Step 11 — Workflow templates**
+**Step 12 — Workflow templates**
 `workflow_templates` and `workflow_configs` seeded. Alert lifecycle workflow in Restate — alert fires → maintenance task → assigned → sign-off → resolved. App shows workflow inbox.
 
 ```
@@ -1224,7 +1387,7 @@ Verifiable: alert triggers maintenance task, operator signs off
             full lifecycle recorded in audit log
 ```
 
-**Step 12 — External context data**
+**Step 13 — External context data**
 Bento HTTP pipeline templates for weather, electricity rates. Platform default `data_sources` seeded. Context readings flowing into `readings` table (device_id=null, scope='global'/'building').
 
 ```
@@ -1232,7 +1395,7 @@ Verifiable: outdoor_temperature visible alongside sensor data
             electricity rate referenceable in rules
 ```
 
-**Step 13 — User-defined data sources**
+**Step 14 — User-defined data sources**
 App UI to register a new HTTP data source. Bento watcher dynamically spawns pipeline. Data flows immediately as unclassified. When user adds data to dashboard or queries it, AI classification triggers. Human approves. Custom data becomes semantically queryable.
 
 ```
@@ -1240,14 +1403,14 @@ Verifiable: user registers API → data flows (unclassified)
             user adds to dashboard → AI proposes classification → approved
 ```
 
-**Step 14 — User-defined rules**
+**Step 15 — User-defined rules**
 App UI to add custom rule — pick point type, threshold, device, notify. PostgREST INSERT into rules (source='user'). Bento evaluates on next cycle.
 
 ```
 Verifiable: user rule fires independently of platform defaults
 ```
 
-**Step 15 — Multi-building**
+**Step 16 — Multi-building**
 Second building, second edge agent, same platform. Building isolation verified. Deployment Mode 2 docker-compose variant written.
 
 ```

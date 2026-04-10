@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 from shared import graph
 from shared.llm import classify_rawtags
+from shared.traced import traced_run, _emit_event
 
 
 class ClassifyRequest(BaseModel):
@@ -30,7 +31,7 @@ async def run(ctx: WorkflowContext, request: ClassifyRequest) -> dict:
     5. Handle approvals/rejections
     """
     # Step 1: Fetch data from graph
-    rawtags = await ctx.run(
+    rawtags = await traced_run(ctx,
         "fetch_rawtags",
         lambda: graph.get_rawtags_for_context(request.tenant_id, request.source_id)
     )
@@ -38,19 +39,19 @@ async def run(ctx: WorkflowContext, request: ClassifyRequest) -> dict:
     if not rawtags:
         return {"status": "error", "message": "No RawTags found for context"}
 
-    property_defs = await ctx.run(
+    property_defs = await traced_run(ctx,
         "fetch_property_defs",
         lambda: graph.get_property_defs(request.tbox_types)
     )
 
     # Step 2: Classify with LLM
-    classifications = await ctx.run(
+    classifications = await traced_run(ctx,
         "classify",
         lambda: classify_rawtags(rawtags, request.tbox_types, property_defs)
     )
 
     # Step 3: Create proposals in graph
-    proposals = await ctx.run(
+    proposals = await traced_run(ctx,
         "create_proposals",
         lambda: _create_proposals(classifications)
     )
@@ -66,6 +67,16 @@ async def run(ctx: WorkflowContext, request: ClassifyRequest) -> dict:
     # Workflow suspends here until /classifier/{id}/review is called
     review_decisions = await ctx.promise("review").value()
 
+    # Emit event for the review decision
+    _emit_event(
+        component="restate.classifier",
+        operation="human_review",
+        data_id=ctx.key(),
+        trace_id=ctx.key(),
+        actor="human",
+        payload={"decisions": review_decisions},
+    )
+
     # Step 5: Process decisions
     approved = []
     rejected = []
@@ -77,20 +88,22 @@ async def run(ctx: WorkflowContext, request: ClassifyRequest) -> dict:
         if matching:
             proposal = matching[0]
             if decision.get("approved"):
-                await ctx.run(
+                await traced_run(ctx,
                     f"approve_{proposal['tbox_type']}",
                     lambda p=proposal: graph.update_is_type_of_status(
                         p["rawtag_id"], p["tbox_type"], "approved", "workflow"
-                    )
+                    ),
+                    data_id=proposal["rawtag_id"],
                 )
                 approved.append(proposal)
             else:
-                await ctx.run(
+                await traced_run(ctx,
                     f"reject_{proposal['tbox_type']}",
                     lambda p=proposal, d=decision: graph.update_is_type_of_status(
                         p["rawtag_id"], p["tbox_type"], "rejected",
                         feedback=d.get("feedback")
-                    )
+                    ),
+                    data_id=proposal["rawtag_id"],
                 )
                 rejected.append(proposal)
 

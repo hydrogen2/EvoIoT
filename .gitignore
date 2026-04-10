@@ -4,3 +4,7 @@ edge-agent/bacnet-simulator/
 .env
 **/.env
 __pycache__/
+
+# Built binaries
+platform/bento-custom/bento-custom.exe
+platform/bento-custom/bento-linux

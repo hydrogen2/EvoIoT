@@ -79,11 +79,12 @@ services:
   # Stream Processing - Telemetry + Discovery (single process, multiple streams)
   # ==========================================================================
   bento:
-    image: ghcr.io/warpstreamlabs/bento:latest
+    build: ./bento-custom
     container_name: evoiot-bento
     volumes:
       - ./bento/streams:/streams:ro
-    command: ["streams", "/streams"]
+      - ./bento/global.yaml:/config/global.yaml:ro
+    command: ["-c", "/config/global.yaml", "streams", "/streams"]
     ports:
       - "4195:4195"
     networks:

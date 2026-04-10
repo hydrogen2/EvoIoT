@@ -1,0 +1,17 @@
+# Bento global config — applies to ALL streams automatically
+# Used with: bento -c /config/global.yaml streams /streams
+
+logger:
+  level: INFO
+  format: json
+
+tracer:
+  pg_events:
+    dsn: "postgres://bento_writer:bento_dev_password@postgres:5432/postgres?sslmode=disable"
+    keep_prefixes:
+      - "input_"
+      - "output_"
+      - "mapping"
+      - "sql_raw"
+      - "log"
+      - "unarchive"

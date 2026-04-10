@@ -467,6 +467,24 @@ BEGIN
         extract(epoch from now())::bigint * 1000
     );
 
+    -- Emit provenance event for graph mutation
+    INSERT INTO evoiot.events (component, operation, data_id, actor, payload)
+    VALUES (
+        'graph',
+        'upsert_rawtag',
+        v_rawtag_id,
+        current_user,
+        jsonb_build_object(
+            'tenant_id', p_tenant_id,
+            'source_id', p_source_id,
+            'device_id', p_device_id,
+            'object_type', p_object_type,
+            'object_instance', p_object_instance,
+            'tag_type', p_tag_type,
+            'raw_data', p_raw_data
+        )
+    );
+
     RETURN v_rawtag_id;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
@@ -474,6 +492,68 @@ $$ LANGUAGE plpgsql SECURITY DEFINER;
 GRANT EXECUTE ON FUNCTION evoiot.compute_rawtag_id TO bento_writer, workflow_rw, postgrest_anon;
 GRANT EXECUTE ON FUNCTION evoiot.get_rawtag_template TO bento_writer, workflow_rw, postgrest_anon;
 GRANT EXECUTE ON FUNCTION evoiot.upsert_rawtag TO bento_writer, workflow_rw;
+
+-- =============================================================================
+-- Unified Events Table (provenance / logging / audit)
+-- =============================================================================
+CREATE TABLE evoiot.events (
+    id          BIGINT GENERATED ALWAYS AS IDENTITY,
+    event_time  TIMESTAMPTZ NOT NULL DEFAULT now(),  -- when the event actually happened
+    component   TEXT NOT NULL,              -- bento, restate.classifier, postgres, graph
+    operation   TEXT NOT NULL,              -- input_mqtt, sql_insert, classify, human_approve
+    data_id     TEXT,                       -- rawtag_id or reading.id (NULL = pure ops log)
+    trace_id    TEXT,                       -- request-level correlation
+    actor       TEXT,                       -- bento, doubao-v3, user@company.com
+    payload     JSONB,                      -- context, flexible per operation
+    PRIMARY KEY (id)
+);
+
+-- Indexes for different query patterns
+CREATE INDEX events_data_id_idx ON evoiot.events (data_id, event_time) WHERE data_id IS NOT NULL;
+CREATE INDEX events_component_idx ON evoiot.events (component, event_time);
+CREATE INDEX events_actor_idx ON evoiot.events (actor, event_time) WHERE actor IS NOT NULL;
+CREATE INDEX events_trace_id_idx ON evoiot.events (trace_id, event_time) WHERE trace_id IS NOT NULL;
+
+-- Append-only: grant INSERT only, explicitly revoke UPDATE/DELETE
+GRANT INSERT ON evoiot.events TO bento_writer, workflow_rw, postgrest_role;
+GRANT SELECT ON evoiot.events TO bento_writer, workflow_rw, postgrest_role, postgrest_anon, ai_reader;
+GRANT USAGE ON SEQUENCE evoiot.events_id_seq TO bento_writer, workflow_rw, postgrest_role;
+REVOKE UPDATE, DELETE ON evoiot.events FROM bento_writer, workflow_rw, postgrest_role;
+
+-- Anonymous read access for development
+CREATE POLICY events_anon_select ON evoiot.events
+    FOR SELECT TO postgrest_anon USING (true);
+
+-- Trigger function to emit events on relational table changes
+-- Uses to_jsonb(NEW) to extract data_id dynamically, handling tables with/without rawtag_id
+CREATE OR REPLACE FUNCTION evoiot.emit_event() RETURNS trigger AS $$
+DECLARE
+    v_new JSONB;
+    v_data_id TEXT;
+BEGIN
+    v_new := to_jsonb(NEW);
+    v_data_id := COALESCE(v_new->>'rawtag_id', v_new->>'id');
+
+    INSERT INTO evoiot.events (component, operation, data_id, actor, payload)
+    VALUES (
+        'postgres',
+        TG_OP,
+        v_data_id,
+        current_user,
+        jsonb_build_object('table', TG_TABLE_NAME, 'new', v_new)
+    );
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Attach triggers to relational tables
+CREATE TRIGGER emit_event_on_change
+    AFTER INSERT OR UPDATE ON evoiot.readings
+    FOR EACH ROW EXECUTE FUNCTION evoiot.emit_event();
+
+CREATE TRIGGER emit_event_on_change
+    AFTER INSERT OR UPDATE ON evoiot.data_sources
+    FOR EACH ROW EXECUTE FUNCTION evoiot.emit_event();
 
 -- =============================================================================
 -- Seed Data Sources with RawTag ID Templates

@@ -2,11 +2,15 @@
 
 import psycopg2
 import json
+import logging
+import re
 import time
 from .config import (
     POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB,
     POSTGRES_USER, POSTGRES_PASSWORD
 )
+
+logger = logging.getLogger(__name__)
 
 
 def get_connection():
@@ -39,8 +43,50 @@ def parse_agtype(value: str) -> dict | None:
         return None
 
 
+def _classify_cypher_op(query: str) -> str:
+    """Classify a Cypher query as a read or write operation."""
+    q = query.strip().upper()
+    if q.startswith("CREATE") or "CREATE " in q:
+        return "CREATE"
+    if "MERGE " in q:
+        return "MERGE"
+    if "SET " in q:
+        return "SET"
+    if "DELETE " in q:
+        return "DELETE"
+    return "MATCH"
+
+
+def _extract_cypher_id(query: str) -> str | None:
+    """Extract the primary ID from a Cypher query (best-effort)."""
+    # Match patterns like {id: 'some-id'} or {name: 'some-name'}
+    m = re.search(r"\{(?:id|name):\s*'([^']+)'", query)
+    return m.group(1) if m else None
+
+
+def _emit_graph_event(operation: str, data_id: str | None, query: str):
+    """Emit an event for a graph mutation to evoiot.events."""
+    # Only emit for write operations
+    if operation == "MATCH":
+        return
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO evoiot.events (component, operation, data_id, actor, payload)
+                       VALUES ('graph', %s, %s, 'restate', %s)""",
+                    (operation, data_id,
+                     json.dumps({"cypher": query[:500]}, default=str))
+                )
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("Failed to emit graph event: %s", e)
+
+
 def execute_cypher(query: str) -> list[dict]:
-    """Execute a Cypher query and return results as dicts."""
+    """Execute a Cypher query, emit event for mutations, return results as dicts."""
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -60,6 +106,9 @@ def execute_cypher(query: str) -> list[dict]:
             return results
     finally:
         conn.close()
+        # Emit event after connection is closed (non-blocking)
+        op = _classify_cypher_op(query)
+        _emit_graph_event(op, _extract_cypher_id(query), query)
 
 
 def get_rawtags_for_context(building_id: str, source_id: str | None = None) -> list[dict]:
