@@ -442,4 +442,4 @@ require (
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
 
-replace github.com/warpstreamlabs/bento => github.com/hydrogen2/bento v0.0.0-20260410035205-5321478d48b5
+replace github.com/warpstreamlabs/bento => github.com/hydrogen2/bento v0.0.0-20260410044946-c02014eff469
