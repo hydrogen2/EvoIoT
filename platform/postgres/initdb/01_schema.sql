@@ -409,6 +409,7 @@ DECLARE
     v_template TEXT;
     v_payload JSONB;
     v_rawtag_id TEXT;
+    v_raw_data_safe TEXT;
 BEGIN
     -- Load AGE extension
     EXECUTE 'LOAD ''age''';
@@ -434,6 +435,12 @@ BEGIN
             v_rawtag_id := p_tenant_id || ':' || p_source_id || ':' || p_device_id || ':' || COALESCE(p_object_type, '') || ':' || COALESCE(p_object_instance, '');
         END IF;
     END IF;
+
+    -- Sanitize raw_data for Cypher string literals.
+    -- format(%L) wraps in single quotes and escapes single quotes by doubling,
+    -- but Cypher's string parser inside $cypher$ blocks cannot handle doubled quotes
+    -- or backslash escapes. Strip all quotes and backslashes from raw_data.
+    v_raw_data_safe := translate(COALESCE(p_raw_data, ''), E'\\''\"', '');
 
     -- MERGE creates if not exists, updates if exists (use EXECUTE for cypher)
     -- Use CASE to preserve existing non-empty values for raw_data, discovered_at, last_seen_by
@@ -461,7 +468,7 @@ BEGIN
         COALESCE(p_object_instance, ''),
         p_protocol,
         p_tag_type,
-        COALESCE(p_raw_data, ''), COALESCE(p_raw_data, ''),
+        v_raw_data_safe, v_raw_data_safe,
         COALESCE(p_discovered_at, ''), COALESCE(p_discovered_at, ''),
         COALESCE(p_last_seen_by, ''), COALESCE(p_last_seen_by, ''),
         extract(epoch from now())::bigint * 1000
