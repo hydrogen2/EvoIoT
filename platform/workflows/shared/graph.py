@@ -85,6 +85,16 @@ def _emit_graph_event(operation: str, data_id: str | None, query: str):
         logger.warning("Failed to emit graph event: %s", e)
 
 
+def _sanitize_cypher_string(value: str) -> str:
+    """Sanitize a string value for use inside Cypher single-quoted literals.
+
+    AGE's Cypher parser inside $$...$$ blocks cannot handle backslash escapes
+    or embedded quotes. Strip all single quotes, double quotes, backslashes,
+    and dollar signs (which could break the $$ delimiter).
+    """
+    return value.translate(str.maketrans('', '', "\\'\"\n\r$"))
+
+
 def execute_cypher(query: str) -> list[dict]:
     """Execute a Cypher query, emit event for mutations, return results as dicts."""
     conn = get_connection()
@@ -104,6 +114,9 @@ def execute_cypher(query: str) -> list[dict]:
                     else:
                         results.append(result)
             return results
+    except Exception as e:
+        print(f"[graph] ERROR Cypher query failed: {e}\nQuery: {query[:500]}", flush=True)
+        return []
     finally:
         conn.close()
         # Emit event after connection is closed (non-blocking)
@@ -165,23 +178,36 @@ def create_is_type_of_edge(
 ) -> dict:
     """Create an IS_TYPE_OF edge between RawTag and PropertyDef."""
     timestamp = int(time.time() * 1000)
-    # Escape for Cypher: backslash-escape quotes and backslashes
-    reason_escaped = reason.replace("\\", "\\\\").replace("'", "\\'")
+    reason_safe = _sanitize_cypher_string(reason)
 
-    query = f"""
+    # MERGE to ensure the edge exists
+    merge_query = f"""
         MATCH (r:RawTag {{id: '{rawtag_id}'}})
         MATCH (p:PropertyDef {{name: '{property_name}'}})
         MERGE (r)-[e:IS_TYPE_OF]->(p)
+        RETURN e
+    """
+    print(f"[graph] Creating IS_TYPE_OF: {rawtag_id} -> {property_name} (confidence={confidence})", flush=True)
+    execute_cypher(merge_query)
+
+    # SET properties separately — AGE doesn't persist SET on edges when
+    # combined with MERGE in the same query via psycopg2 (works in psql).
+    set_query = f"""
+        MATCH (r:RawTag {{id: '{rawtag_id}'}})-[e:IS_TYPE_OF]->(p:PropertyDef {{name: '{property_name}'}})
         SET e.status = '{status}',
             e.confidence = {confidence},
-            e.reason = '{reason_escaped}',
+            e.reason = '{reason_safe}',
             e.proposed_at = {timestamp},
             e.approved_at = null,
             e.approved_by = null,
             e.feedback = null
         RETURN e
     """
-    results = execute_cypher(query)
+    results = execute_cypher(set_query)
+    if results:
+        print(f"[graph] IS_TYPE_OF edge properties set: {results[0]}", flush=True)
+    else:
+        print(f"[graph] WARNING: IS_TYPE_OF SET returned empty for {rawtag_id} -> {property_name}", flush=True)
     return results[0] if results else {}
 
 
@@ -226,8 +252,7 @@ def update_is_type_of_status(
         set_clauses.append(f"e.approved_at = {timestamp}")
         set_clauses.append(f"e.approved_by = '{approved_by}'")
     if feedback:
-        feedback_escaped = feedback.replace("\\", "\\\\").replace("'", "\\'")
-        set_clauses.append(f"e.feedback = '{feedback_escaped}'")
+        set_clauses.append(f"e.feedback = '{_sanitize_cypher_string(feedback)}'")
 
     set_clause = ", ".join(set_clauses)
 
