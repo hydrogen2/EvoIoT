@@ -302,6 +302,49 @@ $$ LANGUAGE plpgsql VOLATILE SECURITY DEFINER;
 
 GRANT EXECUTE ON FUNCTION evoiot.get_readings_by_type TO postgrest_role, postgrest_anon, ai_reader, workflow_rw;
 
+-- List equipment for a tenant, with device type and classified point types
+CREATE OR REPLACE FUNCTION evoiot.list_equipment(
+    p_tenant_id TEXT DEFAULT null
+) RETURNS jsonb AS $$
+DECLARE
+    v_tenant_id TEXT;
+    v_result jsonb;
+    v_sql TEXT;
+BEGIN
+    EXECUTE 'LOAD ''age''';
+    EXECUTE 'SET search_path TO ag_catalog, evoiot, public';
+
+    v_tenant_id := COALESCE(p_tenant_id,
+        current_setting('request.jwt.claims', true)::json->>'tenant_id',
+        'default');
+
+    v_sql := format($sql$
+        SELECT COALESCE(jsonb_agg(row_to_json(sub)::jsonb), '[]'::jsonb)
+        FROM (
+            SELECT
+                e_name::text AS equipment,
+                d_name::text AS device_type,
+                array_agg(DISTINCT p_name::text) FILTER (WHERE p_name IS NOT NULL) AS point_types
+            FROM (
+                SELECT * FROM ag_catalog.cypher('platform', $cypher$
+                    MATCH (e:Equipment {tenant_id: %L})-[:IS_TYPE_OF]->(d:DeviceType)
+                    OPTIONAL MATCH (r:RawTag)-[:BELONGS_TO]->(e),
+                                   (r)-[:IS_TYPE_OF]->(p:PropertyDef)
+                    RETURN e.name, d.name, p.name
+                $cypher$) AS (e_name agtype, d_name agtype, p_name agtype)
+            ) graph_data
+            GROUP BY e_name, d_name
+            ORDER BY d_name, e_name
+        ) sub
+    $sql$, v_tenant_id);
+
+    EXECUTE v_sql INTO v_result;
+    RETURN v_result;
+END;
+$$ LANGUAGE plpgsql VOLATILE SECURITY DEFINER;
+
+GRANT EXECUTE ON FUNCTION evoiot.list_equipment TO postgrest_role, postgrest_anon, ai_reader, workflow_rw;
+
 -- Function to compute rawtag_id from template and payload
 -- Template uses {field_name} syntax, e.g., "{tenant_id}:{source_id}:{device_id}:{object_type}:{object_instance}"
 CREATE OR REPLACE FUNCTION evoiot.compute_rawtag_id(
