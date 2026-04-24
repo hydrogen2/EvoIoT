@@ -81,12 +81,13 @@ Example response:
 }}"""
 
 
-def _call_llm(system_prompt: str, user_content: str) -> str:
+def _call_llm(system_prompt: str, user_content: str, max_tokens: int = 16384) -> str:
     """Call LLM and return the raw content string, stripping markdown fences."""
     response = litellm.completion(
         model=LLM_MODEL,
         api_base=LLM_API_BASE if LLM_API_BASE else None,
         api_key=LLM_API_KEY if LLM_API_KEY else None,
+        max_tokens=max_tokens,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content}
@@ -116,21 +117,42 @@ def discover_equipment_from_rawtags(
     device_types_str = "\n".join(
         f"- {dt.get('name', '')}: {dt.get('label', '')}" for dt in device_types
     )
-    rawtags_str = json.dumps(rawtags, indent=2, default=str)
+
+    # Send condensed rawtag info — only id, object_name, type, unit to stay within token limits
+    condensed = []
+    for rt in rawtags:
+        raw_data = rt.get("raw_data", "")
+        # Extract object_name from raw_data string like "{...,object_name:UCS-2 FOO,...}"
+        obj_name = ""
+        if "object_name:" in raw_data:
+            obj_name = raw_data.split("object_name:")[1].split(",")[0].strip().rstrip("}")
+        condensed.append({
+            "id": rt.get("id", ""),
+            "name": obj_name,
+            "type": rt.get("object_type", ""),
+        })
+    rawtags_str = json.dumps(condensed, default=str)
 
     user_content = DISCOVER_EQUIPMENT_USER_TEMPLATE.format(
         device_types=device_types_str,
         rawtags=rawtags_str,
     )
 
+    print(f"[llm] discover_equipment: sending {len(rawtags)} rawtags, {len(device_types)} device types", flush=True)
     content = _call_llm(DISCOVER_EQUIPMENT_SYSTEM_PROMPT, user_content)
+    print(f"[llm] discover_equipment response length: {len(content)}", flush=True)
+    print(f"[llm] discover_equipment response preview: {content[:500]}", flush=True)
 
     try:
         result = json.loads(content)
         if isinstance(result, list):
+            print(f"[llm] discover_equipment: parsed {len(result)} equipment groups", flush=True)
             return result
+        print(f"[llm] discover_equipment: unexpected result type: {type(result)}", flush=True)
         return []
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        print(f"[llm] discover_equipment: JSON parse error: {e}", flush=True)
+        print(f"[llm] discover_equipment: raw content: {content[:1000]}", flush=True)
         return []
 
 

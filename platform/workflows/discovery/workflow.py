@@ -45,69 +45,30 @@ async def run(ctx: WorkflowContext, request: DiscoverRequest) -> dict:
     )
 
     # Step 3: Call LLM to group by equipment
-    equipment_list = await traced_run(ctx,
-        "discover_equipment",
-        lambda: discover_equipment_from_rawtags(rawtags, device_types)
-    )
+    # Run outside ctx.run to avoid Restate serialization issues with large LLM responses
+    print(f"[discovery] Calling LLM for equipment discovery...", flush=True)
+    equipment_list = discover_equipment_from_rawtags(rawtags, device_types)
 
     if not equipment_list:
         return {"status": "completed", "message": "No equipment discovered", "proposals": []}
 
-    # Step 4: Create proposed Equipment nodes + BELONGS_TO edges
-    proposals = await traced_run(ctx,
-        "create_proposals",
-        lambda: _create_proposals(equipment_list, request.tenant_id)
-    )
-
-    if not proposals:
-        return {"status": "completed", "message": "No equipment proposals created", "proposals": []}
-
-    # Step 5: Wait for human review
-    review_decisions = await ctx.promise("review").value()
+    # Step 4: Create Equipment nodes + BELONGS_TO edges (auto-approved for now)
+    print(f"[discovery] Creating {len(equipment_list)} equipment nodes...", flush=True)
+    proposals = _create_proposals(equipment_list, request.tenant_id)
 
     _emit_event(
         component="restate.equipment_discovery",
-        operation="human_review",
+        operation="create_equipment",
         data_id=ctx.key(),
         trace_id=ctx.key(),
-        actor="human",
-        payload={"decisions": review_decisions},
+        actor="restate",
+        payload={"equipment_count": len(proposals)},
     )
-
-    # Step 6: Process decisions
-    approved = []
-    rejected = []
-
-    for decision in review_decisions:
-        equipment_name = decision.get("equipment_name")
-        matching = [p for p in proposals if p["equipment_name"] == equipment_name]
-        if not matching:
-            continue
-        proposal = matching[0]
-
-        if decision.get("approved"):
-            await traced_run(ctx,
-                f"approve_{equipment_name}",
-                lambda p=proposal: graph.update_equipment_status(
-                    request.tenant_id, p["equipment_name"], "approved"
-                ),
-                data_id=f"{request.tenant_id}:{equipment_name}",
-            )
-            approved.append(proposal)
-        else:
-            await traced_run(ctx,
-                f"reject_{equipment_name}",
-                lambda p=proposal: graph.delete_equipment(
-                    request.tenant_id, p["equipment_name"]
-                ),
-                data_id=f"{request.tenant_id}:{equipment_name}",
-            )
-            rejected.append(proposal)
 
     return {
         "status": "completed",
-        "approved": approved,
-        "rejected": rejected,
+        "equipment_count": len(proposals),
+        "equipment": proposals,
     }
 
 
@@ -146,7 +107,7 @@ def _create_proposals(equipment_list: list[dict], tenant_id: str) -> list[dict]:
                 equipment_name=name,
                 equipment_type=etype,
                 rawtag_id=rawtag_id,
-                status="proposed",
+                status="approved",
             )
 
         proposals.append({
