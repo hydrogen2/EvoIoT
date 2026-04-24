@@ -45,30 +45,24 @@ async def run(ctx: WorkflowContext, request: DiscoverRequest) -> dict:
     )
 
     # Step 3: Call LLM to group by equipment
-    # Run outside ctx.run to avoid Restate serialization issues with large LLM responses
-    print(f"[discovery] Calling LLM for equipment discovery...", flush=True)
-    equipment_list = discover_equipment_from_rawtags(rawtags, device_types)
+    equipment_list = await traced_run(ctx,
+        "discover_equipment",
+        lambda: discover_equipment_from_rawtags(rawtags, device_types)
+    )
 
     if not equipment_list:
-        return {"status": "completed", "message": "No equipment discovered", "proposals": []}
+        return {"status": "completed", "message": "No equipment discovered", "equipment": []}
 
-    # Step 4: Create Equipment nodes + BELONGS_TO edges (auto-approved for now)
-    print(f"[discovery] Creating {len(equipment_list)} equipment nodes...", flush=True)
-    proposals = _create_proposals(equipment_list, request.tenant_id)
-
-    _emit_event(
-        component="restate.equipment_discovery",
-        operation="create_equipment",
-        data_id=ctx.key(),
-        trace_id=ctx.key(),
-        actor="restate",
-        payload={"equipment_count": len(proposals)},
+    # Step 4: Create Equipment nodes + BELONGS_TO edges
+    created = await traced_run(ctx,
+        "create_equipment",
+        lambda: _create_proposals(equipment_list, request.tenant_id)
     )
 
     return {
         "status": "completed",
-        "equipment_count": len(proposals),
-        "equipment": proposals,
+        "equipment_count": len(created),
+        "equipment": created,
     }
 
 

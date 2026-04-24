@@ -117,6 +117,9 @@ services:
       - evoiot
     environment:
       RESTATE_OBSERVABILITY__LOG__FORMAT: json
+      # LLM calls can take minutes — increase handler timeout
+      RESTATE_WORKER__INVOKER__INACTIVITY_TIMEOUT: 10min
+      RESTATE_WORKER__INVOKER__MESSAGE_SIZE_LIMIT: 10485760
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9070/health"]
       interval: 10s
