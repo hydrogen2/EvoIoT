@@ -169,6 +169,73 @@ def get_property_defs(names: list[str]) -> list[dict]:
     return parsed
 
 
+def get_device_types() -> list[dict]:
+    """Get all DeviceType nodes."""
+    query = "MATCH (d:DeviceType) RETURN d"
+    results = execute_cypher(query)
+    parsed = []
+    for r in results:
+        if isinstance(r, dict) and 'properties' in r:
+            parsed.append(r['properties'])
+        elif isinstance(r, dict):
+            parsed.append(r)
+    return parsed
+
+
+def create_equipment_and_link(
+    tenant_id: str,
+    equipment_name: str,
+    equipment_type: str,
+    rawtag_id: str
+) -> None:
+    """Create Equipment node, link it to DeviceType, and link RawTag to it.
+
+    Equipment ID = {tenant_id}:{equipment_name}
+    Creates:
+      Equipment --IS_TYPE_OF--> DeviceType
+      RawTag --BELONGS_TO--> Equipment
+    """
+    if not equipment_name or not equipment_type:
+        return
+
+    equip_id = f"{tenant_id}:{equipment_name}"
+    equip_name_safe = _sanitize_cypher_string(equipment_name)
+    equip_type_safe = _sanitize_cypher_string(equipment_type)
+
+    print(f"[graph] Creating Equipment: {equip_id} (type={equipment_type})", flush=True)
+
+    # MERGE Equipment node
+    execute_cypher(f"""
+        MERGE (e:Equipment {{id: '{equip_id}'}})
+        RETURN e
+    """)
+    # SET properties separately (AGE MERGE+SET bug)
+    execute_cypher(f"""
+        MATCH (e:Equipment {{id: '{equip_id}'}})
+        SET e.name = '{equip_name_safe}',
+            e.tenant_id = '{tenant_id}'
+        RETURN e
+    """)
+
+    # MERGE Equipment --IS_TYPE_OF--> DeviceType
+    execute_cypher(f"""
+        MATCH (e:Equipment {{id: '{equip_id}'}})
+        MATCH (d:DeviceType {{name: '{equip_type_safe}'}})
+        MERGE (e)-[:IS_TYPE_OF]->(d)
+        RETURN e
+    """)
+
+    # MERGE RawTag --BELONGS_TO--> Equipment
+    execute_cypher(f"""
+        MATCH (r:RawTag {{id: '{rawtag_id}'}})
+        MATCH (e:Equipment {{id: '{equip_id}'}})
+        MERGE (r)-[:BELONGS_TO]->(e)
+        RETURN r
+    """)
+
+    print(f"[graph] Linked RawTag {rawtag_id} -> Equipment {equip_id} -> DeviceType {equipment_type}", flush=True)
+
+
 def create_is_type_of_edge(
     rawtag_id: str,
     property_name: str,

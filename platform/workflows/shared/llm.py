@@ -13,17 +13,24 @@ For each property type, return:
 - The ID of the best matching raw tag (or null if no good match)
 - A confidence score from 0.0 to 1.0
 - A brief reason for the match
+- The equipment name extracted from the object name (e.g. "PAU_01_103_1" from "NPCCR_PAU_01_103_1_SaT")
+- The equipment type from the available device types list (e.g. "PAU", "FCU", "AHU")
 
 Consider:
-- Object names often contain abbreviations (SAT=Supply Air Temp, RAT=Return Air Temp, etc.)
+- Object names often encode equipment identity and point type, e.g. "NPCCR_PAU_01_103_1_SaT" means building=NPCCR, equipment=PAU_01_103_1, point=SaT
+- Object names often contain abbreviations (SAT=Supply Air Temp, RAT=Return Air Temp, OaT=Outdoor Air Temp, ChwST=Chilled Water Supply Temp, etc.)
 - Object types (analog-input, analog-output, binary-input, etc.)
 - Value ranges and units when available
 - The raw_data field may contain additional metadata
+- Equipment names should be extracted WITHOUT the building prefix (e.g. "PAU_01_103_1" not "NPCCR_PAU_01_103_1")
 
 Respond in JSON format only."""
 
 CLASSIFY_USER_TEMPLATE = """## Target Property Types:
 {property_types}
+
+## Available Device Types:
+{device_types}
 
 ## Available Raw Tags:
 {rawtags}
@@ -35,11 +42,13 @@ Respond with a JSON object where keys are property type names and values are obj
 - "rawtag_id": string or null
 - "confidence": number 0.0-1.0
 - "reason": string
+- "equipment_name": string - the equipment name extracted from the object name (without building prefix)
+- "equipment_type": string - one of the available device types above
 
 Example response:
 {{
-  "supply_air_temp": {{"rawtag_id": "bacnet-sim:device-1:analog-input:1", "confidence": 0.95, "reason": "Object name 'SAT' matches supply air temperature"}},
-  "return_air_temp": {{"rawtag_id": null, "confidence": 0.0, "reason": "No matching tag found"}}
+  "supply_air_temp": {{"rawtag_id": "bldg:agent:161:analog-input:3", "confidence": 0.95, "reason": "Object name SAT matches supply air temperature", "equipment_name": "PAU_01_103_1", "equipment_type": "PAU"}},
+  "return_air_temp": {{"rawtag_id": null, "confidence": 0.0, "reason": "No matching tag found", "equipment_name": null, "equipment_type": null}}
 }}"""
 
 
@@ -47,6 +56,7 @@ def classify_rawtags(
     rawtags: list[dict],
     tbox_types: list[str],
     property_defs: list[dict],
+    device_types: list[dict] | None = None,
     feedback: str | None = None
 ) -> dict:
     """
@@ -56,10 +66,11 @@ def classify_rawtags(
         rawtags: List of RawTag nodes from graph
         tbox_types: List of property type names to classify
         property_defs: PropertyDef nodes with metadata (label, description, etc.)
+        device_types: DeviceType nodes with metadata (name, label, etc.)
         feedback: Optional human feedback for rework
 
     Returns:
-        Dict mapping tbox_type -> {candidates: [{rawtag_id, confidence, reason}]}
+        Dict mapping tbox_type -> {candidates: [{rawtag_id, confidence, reason, equipment_name, equipment_type}]}
     """
     if not rawtags or not tbox_types:
         return {t: {"candidates": []} for t in tbox_types}
@@ -78,6 +89,15 @@ def classify_rawtags(
 
     property_types_str = "\n".join(prop_info)
 
+    # Format device types
+    device_types_str = ""
+    if device_types:
+        device_types_str = "\n".join(
+            f"- {dt.get('name', '')}: {dt.get('label', '')}" for dt in device_types
+        )
+    else:
+        device_types_str = "(not available)"
+
     # Format raw tags
     rawtags_str = json.dumps(rawtags, indent=2, default=str)
 
@@ -91,6 +111,7 @@ Please reconsider your classifications based on this feedback."""
 
     user_content = CLASSIFY_USER_TEMPLATE.format(
         property_types=property_types_str,
+        device_types=device_types_str,
         rawtags=rawtags_str,
         feedback_section=feedback_section
     )
@@ -127,7 +148,9 @@ Please reconsider your classifications based on this feedback."""
             candidates.append({
                 "rawtag_id": match["rawtag_id"],
                 "confidence": match.get("confidence", 0.0),
-                "reason": match.get("reason", "")
+                "reason": match.get("reason", ""),
+                "equipment_name": match.get("equipment_name"),
+                "equipment_type": match.get("equipment_type"),
             })
         results[tbox_type] = {"candidates": candidates}
 

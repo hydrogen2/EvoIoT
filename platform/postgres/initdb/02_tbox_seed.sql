@@ -60,6 +60,16 @@ SELECT * FROM cypher('platform', $$
   }) RETURN n
 $$) AS (n agtype);
 
+SELECT * FROM cypher('platform', $$
+  CREATE (n:DeviceType {
+    name: 'PAU',
+    label: 'Pre-conditioned Air Unit',
+    description: 'Unit that pre-conditions outdoor air before supplying to the building, typically with cooling/heating coils and filters',
+    category: 'hvac',
+    brick_class: 'https://brickschema.org/schema/Brick#Pre_Conditioned_Air_Unit'
+  }) RETURN n
+$$) AS (n agtype);
+
 -- Cooling Equipment
 SELECT * FROM cypher('platform', $$
   CREATE (n:DeviceType {

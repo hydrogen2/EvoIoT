@@ -44,16 +44,21 @@ async def run(ctx: WorkflowContext, request: ClassifyRequest) -> dict:
         lambda: graph.get_property_defs(request.tbox_types)
     )
 
-    # Step 2: Classify with LLM
-    classifications = await traced_run(ctx,
-        "classify",
-        lambda: classify_rawtags(rawtags, request.tbox_types, property_defs)
+    device_types = await traced_run(ctx,
+        "fetch_device_types",
+        lambda: graph.get_device_types()
     )
 
-    # Step 3: Create proposals in graph
+    # Step 2: Classify with LLM (includes equipment extraction)
+    classifications = await traced_run(ctx,
+        "classify",
+        lambda: classify_rawtags(rawtags, request.tbox_types, property_defs, device_types)
+    )
+
+    # Step 3: Create proposals in graph (includes equipment nodes)
     proposals = await traced_run(ctx,
         "create_proposals",
-        lambda: _create_proposals(classifications)
+        lambda: _create_proposals(classifications, tenant_id=request.tenant_id)
     )
 
     if not proposals:
@@ -135,8 +140,8 @@ async def review(ctx: WorkflowSharedContext, decisions: list[dict]) -> dict:
 
 # Helper functions (sync for ctx.run journaling)
 
-def _create_proposals(classifications: dict) -> list[dict]:
-    """Create proposal edges in graph for each classification."""
+def _create_proposals(classifications: dict, tenant_id: str = "") -> list[dict]:
+    """Create proposal edges and equipment nodes in graph for each classification."""
     proposals = []
     for tbox_type, result in classifications.items():
         for candidate in result.get("candidates", []):
@@ -150,11 +155,25 @@ def _create_proposals(classifications: dict) -> list[dict]:
                     confidence=candidate.get("confidence", 0.0),
                     reason=candidate.get("reason", "")
                 )
+
+                # Create Equipment node and BELONGS_TO edge if LLM extracted equipment info
+                equipment_name = candidate.get("equipment_name")
+                equipment_type = candidate.get("equipment_type")
+                if equipment_name and equipment_type:
+                    graph.create_equipment_and_link(
+                        tenant_id=tenant_id,
+                        equipment_name=equipment_name,
+                        equipment_type=equipment_type,
+                        rawtag_id=rawtag_id,
+                    )
+
                 proposals.append({
                     "rawtag_id": rawtag_id,
                     "tbox_type": tbox_type,
                     "confidence": candidate.get("confidence", 0.0),
                     "reason": candidate.get("reason", ""),
+                    "equipment_name": equipment_name,
+                    "equipment_type": equipment_type,
                     "status": "proposed"
                 })
     return proposals
