@@ -9,9 +9,9 @@ from shared.traced import traced_run, _emit_event
 
 
 class ClassifyRequest(BaseModel):
-    """Request to classify raw tags for a set of TBox types."""
+    """Request to classify raw tags for a specific equipment and point types."""
     tenant_id: str
-    source_id: str | None = None
+    equipment: str          # equipment name (e.g. "PAU_01_103_1")
     tbox_types: list[str]
 
 
@@ -24,41 +24,48 @@ async def run(ctx: WorkflowContext, request: ClassifyRequest) -> dict:
     """
     Main classification workflow.
 
-    1. Fetch RawTags and PropertyDefs
-    2. Call LLM to classify
-    3. Create proposals in graph
-    4. Wait for human review
-    5. Handle approvals/rejections
+    1. Fetch RawTags belonging to the equipment
+    2. Fetch PropertyDefs and equipment type
+    3. Call LLM to classify (scoped to this equipment)
+    4. Create proposals in graph
+    5. Wait for human review
+    6. Handle approvals/rejections
     """
-    # Step 1: Fetch data from graph
+    # Step 1: Fetch RawTags for this equipment
     rawtags = await traced_run(ctx,
         "fetch_rawtags",
-        lambda: graph.get_rawtags_for_context(request.tenant_id, request.source_id)
+        lambda: graph.get_equipment_rawtags(request.tenant_id, request.equipment)
     )
 
     if not rawtags:
-        return {"status": "error", "message": "No RawTags found for context"}
+        return {"status": "error", "message": f"No RawTags found for equipment {request.equipment}"}
 
+    # Step 2: Fetch PropertyDefs and equipment info
     property_defs = await traced_run(ctx,
         "fetch_property_defs",
         lambda: graph.get_property_defs(request.tbox_types)
     )
 
-    device_types = await traced_run(ctx,
-        "fetch_device_types",
-        lambda: graph.get_device_types()
+    # Get equipment type from graph
+    equip_info = await traced_run(ctx,
+        "fetch_equipment_info",
+        lambda: _get_equipment_type(request.tenant_id, request.equipment)
     )
 
-    # Step 2: Classify with LLM (includes equipment extraction)
+    # Step 3: Classify with LLM (scoped to this equipment's tags)
     classifications = await traced_run(ctx,
         "classify",
-        lambda: classify_rawtags(rawtags, request.tbox_types, property_defs, device_types)
+        lambda: classify_rawtags(
+            rawtags, request.tbox_types, property_defs,
+            equipment_name=request.equipment,
+            equipment_type=equip_info.get("device_type", ""),
+        )
     )
 
-    # Step 3: Create proposals in graph (includes equipment nodes)
+    # Step 4: Create proposals in graph
     proposals = await traced_run(ctx,
         "create_proposals",
-        lambda: _create_proposals(classifications, tenant_id=request.tenant_id)
+        lambda: _create_proposals(classifications)
     )
 
     if not proposals:
@@ -68,11 +75,9 @@ async def run(ctx: WorkflowContext, request: ClassifyRequest) -> dict:
             "proposals": []
         }
 
-    # Step 4: Wait for human review
-    # Workflow suspends here until /classifier/{id}/review is called
+    # Step 5: Wait for human review
     review_decisions = await ctx.promise("review").value()
 
-    # Emit event for the review decision
     _emit_event(
         component="restate.classifier",
         operation="human_review",
@@ -82,7 +87,7 @@ async def run(ctx: WorkflowContext, request: ClassifyRequest) -> dict:
         payload={"decisions": review_decisions},
     )
 
-    # Step 5: Process decisions
+    # Step 6: Process decisions
     approved = []
     rejected = []
 
@@ -122,7 +127,6 @@ async def run(ctx: WorkflowContext, request: ClassifyRequest) -> dict:
 @classification_workflow.handler()
 async def get_proposals(ctx: WorkflowSharedContext) -> dict:
     """Get the current proposals pending review."""
-    # Query graph for proposals with status='proposed'
     proposals = graph.get_pending_proposals()
     return {"status": "pending_review", "proposals": proposals}
 
@@ -138,16 +142,31 @@ async def review(ctx: WorkflowSharedContext, decisions: list[dict]) -> dict:
     return {"status": "review submitted", "decisions": decisions}
 
 
-# Helper functions (sync for ctx.run journaling)
+# Helper functions
 
-def _create_proposals(classifications: dict, tenant_id: str = "") -> list[dict]:
-    """Create proposal edges and equipment nodes in graph for each classification."""
+def _get_equipment_type(tenant_id: str, equipment_name: str) -> dict:
+    """Get the device type of an equipment from graph."""
+    equip_id = f"{tenant_id}:{equipment_name}"
+    query = f"""
+        MATCH (e:Equipment {{id: '{equip_id}'}})-[:IS_TYPE_OF]->(d:DeviceType)
+        RETURN d.name
+    """
+    results = graph.execute_cypher(query)
+    if results:
+        dtype = results[0]
+        if isinstance(dtype, dict) and 'properties' in dtype:
+            return {"device_type": dtype['properties'].get('name', '')}
+        return {"device_type": str(dtype).strip('"')}
+    return {"device_type": ""}
+
+
+def _create_proposals(classifications: dict) -> list[dict]:
+    """Create proposal edges in graph for each classification."""
     proposals = []
     for tbox_type, result in classifications.items():
         for candidate in result.get("candidates", []):
             rawtag_id = candidate.get("rawtag_id")
             if rawtag_id:
-                # Create IS_TYPE_OF edge in graph with status=proposed
                 graph.create_is_type_of_edge(
                     rawtag_id=rawtag_id,
                     property_name=tbox_type,
@@ -155,25 +174,11 @@ def _create_proposals(classifications: dict, tenant_id: str = "") -> list[dict]:
                     confidence=candidate.get("confidence", 0.0),
                     reason=candidate.get("reason", "")
                 )
-
-                # Create Equipment node and BELONGS_TO edge if LLM extracted equipment info
-                equipment_name = candidate.get("equipment_name")
-                equipment_type = candidate.get("equipment_type")
-                if equipment_name and equipment_type:
-                    graph.create_equipment_and_link(
-                        tenant_id=tenant_id,
-                        equipment_name=equipment_name,
-                        equipment_type=equipment_type,
-                        rawtag_id=rawtag_id,
-                    )
-
                 proposals.append({
                     "rawtag_id": rawtag_id,
                     "tbox_type": tbox_type,
                     "confidence": candidate.get("confidence", 0.0),
                     "reason": candidate.get("reason", ""),
-                    "equipment_name": equipment_name,
-                    "equipment_type": equipment_type,
                     "status": "proposed"
                 })
     return proposals

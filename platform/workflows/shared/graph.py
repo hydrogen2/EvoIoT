@@ -186,7 +186,8 @@ def create_equipment_and_link(
     tenant_id: str,
     equipment_name: str,
     equipment_type: str,
-    rawtag_id: str
+    rawtag_id: str,
+    status: str = "approved",
 ) -> None:
     """Create Equipment node, link it to DeviceType, and link RawTag to it.
 
@@ -202,7 +203,7 @@ def create_equipment_and_link(
     equip_name_safe = _sanitize_cypher_string(equipment_name)
     equip_type_safe = _sanitize_cypher_string(equipment_type)
 
-    print(f"[graph] Creating Equipment: {equip_id} (type={equipment_type})", flush=True)
+    print(f"[graph] Creating Equipment: {equip_id} (type={equipment_type}, status={status})", flush=True)
 
     # MERGE Equipment node
     execute_cypher(f"""
@@ -213,7 +214,8 @@ def create_equipment_and_link(
     execute_cypher(f"""
         MATCH (e:Equipment {{id: '{equip_id}'}})
         SET e.name = '{equip_name_safe}',
-            e.tenant_id = '{tenant_id}'
+            e.tenant_id = '{tenant_id}',
+            e.status = '{status}'
         RETURN e
     """)
 
@@ -234,6 +236,73 @@ def create_equipment_and_link(
     """)
 
     print(f"[graph] Linked RawTag {rawtag_id} -> Equipment {equip_id} -> DeviceType {equipment_type}", flush=True)
+
+
+def update_equipment_status(tenant_id: str, equipment_name: str, status: str) -> None:
+    """Update the status of an Equipment node."""
+    equip_id = f"{tenant_id}:{equipment_name}"
+    execute_cypher(f"""
+        MATCH (e:Equipment {{id: '{equip_id}'}})
+        SET e.status = '{status}'
+        RETURN e
+    """)
+    print(f"[graph] Equipment {equip_id} status -> {status}", flush=True)
+
+
+def delete_equipment(tenant_id: str, equipment_name: str) -> None:
+    """Delete an Equipment node and its BELONGS_TO edges."""
+    equip_id = f"{tenant_id}:{equipment_name}"
+    execute_cypher(f"""
+        MATCH (e:Equipment {{id: '{equip_id}'}})
+        OPTIONAL MATCH ()-[b:BELONGS_TO]->(e)
+        OPTIONAL MATCH (e)-[t:IS_TYPE_OF]->()
+        DELETE b, t, e
+        RETURN count(*)
+    """)
+    print(f"[graph] Deleted Equipment {equip_id}", flush=True)
+
+
+def get_pending_equipment() -> list[dict]:
+    """Get all Equipment nodes with status='proposed'."""
+    query = """
+        MATCH (e:Equipment)-[:IS_TYPE_OF]->(d:DeviceType)
+        WHERE e.status = 'proposed'
+        RETURN e.id AS id, e.name AS name, d.name AS device_type, e.tenant_id AS tenant_id
+    """
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            sql = f"SELECT * FROM cypher('platform', $${query}$$) AS (id agtype, name agtype, device_type agtype, tenant_id agtype)"
+            cur.execute(sql)
+            rows = cur.fetchall()
+            return [
+                {
+                    "id": str(row[0]).strip('"') if row[0] else None,
+                    "equipment_name": str(row[1]).strip('"') if row[1] else None,
+                    "device_type": str(row[2]).strip('"') if row[2] else None,
+                    "tenant_id": str(row[3]).strip('"') if row[3] else None,
+                }
+                for row in rows
+            ]
+    finally:
+        conn.close()
+
+
+def get_equipment_rawtags(tenant_id: str, equipment_name: str) -> list[dict]:
+    """Get all RawTags belonging to a specific equipment."""
+    equip_id = f"{tenant_id}:{equipment_name}"
+    query = f"""
+        MATCH (r:RawTag)-[:BELONGS_TO]->(e:Equipment {{id: '{equip_id}'}})
+        RETURN r
+    """
+    results = execute_cypher(query)
+    parsed = []
+    for r in results:
+        if isinstance(r, dict) and 'properties' in r:
+            parsed.append(r['properties'])
+        elif isinstance(r, dict):
+            parsed.append(r)
+    return parsed
 
 
 def create_is_type_of_edge(

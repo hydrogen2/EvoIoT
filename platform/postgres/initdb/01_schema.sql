@@ -169,9 +169,9 @@ GRANT SELECT ON evoiot.data_sources TO postgrest_anon;
 
 -- Function to get readings by ontology type with classification-on-read
 CREATE OR REPLACE FUNCTION evoiot.get_readings_by_type(
+    p_equipment TEXT,
     p_tbox_type TEXT,
     p_tenant_id TEXT DEFAULT null,
-    p_equipment TEXT DEFAULT null,
     p_start TIMESTAMPTZ DEFAULT now() - interval '1 hour',
     p_end TIMESTAMPTZ DEFAULT now()
 ) RETURNS jsonb AS $$
@@ -191,42 +191,29 @@ BEGIN
         current_setting('request.jwt.claims', true)::json->>'tenant_id',
         'default');
 
-    -- Check if any RawTag has approved IS_TYPE_OF edge to this type
-    -- Scoped to tenant to avoid cross-tenant false positives
-    IF p_equipment IS NOT NULL THEN
-        v_sql := format(
-            $sql$SELECT EXISTS (
-                SELECT 1 FROM ag_catalog.cypher('platform', $cypher$
-                    MATCH (r:RawTag)-[:IS_TYPE_OF {status: 'approved'}]->(p:PropertyDef {name: %L}),
-                          (r)-[:BELONGS_TO]->(e:Equipment {id: %L})
-                    RETURN r.id LIMIT 1
-                $cypher$) AS (id agtype)
-            )$sql$,
-            p_tbox_type,
-            v_tenant_id || ':' || p_equipment
-        );
-    ELSE
-        v_sql := format(
-            $sql$SELECT EXISTS (
-                SELECT 1 FROM ag_catalog.cypher('platform', $cypher$
-                    MATCH (r:RawTag {building_id: %L})-[:IS_TYPE_OF {status: 'approved'}]->(p:PropertyDef {name: %L})
-                    RETURN r.id LIMIT 1
-                $cypher$) AS (id agtype)
-            )$sql$,
-            v_tenant_id,
-            p_tbox_type
-        );
-    END IF;
+    -- Check if this equipment's RawTag has approved IS_TYPE_OF edge to this type
+    v_sql := format(
+        $sql$SELECT EXISTS (
+            SELECT 1 FROM ag_catalog.cypher('platform', $cypher$
+                MATCH (r:RawTag)-[:IS_TYPE_OF {status: 'approved'}]->(p:PropertyDef {name: %L}),
+                      (r)-[:BELONGS_TO]->(e:Equipment {id: %L})
+                RETURN r.id LIMIT 1
+            $cypher$) AS (id agtype)
+        )$sql$,
+        p_tbox_type,
+        v_tenant_id || ':' || p_equipment
+    );
     EXECUTE v_sql INTO v_has_classification;
 
-    -- If no classification, trigger classifier workflow (async via pg_net)
+    -- If no classification, trigger classifier workflow (scoped to this equipment)
     IF NOT v_has_classification THEN
         PERFORM net.http_post(
             url := 'http://restate:8080/classifier/' ||
-                   encode(convert_to(v_tenant_id || ':' || p_tbox_type, 'UTF8'), 'base64') ||
+                   encode(convert_to(v_tenant_id || ':' || p_equipment || ':' || p_tbox_type, 'UTF8'), 'base64') ||
                    '/run',
             body := jsonb_build_object(
                 'tenant_id', v_tenant_id,
+                'equipment', p_equipment,
                 'tbox_types', ARRAY[p_tbox_type]
             ),
             headers := '{"Content-Type": "application/json"}'::jsonb
@@ -234,7 +221,7 @@ BEGIN
 
         RETURN jsonb_build_object(
             'status', 'classification_pending',
-            'message', 'No approved classification found for ' || p_tbox_type || '. Classifier workflow triggered.',
+            'message', 'No approved classification found for ' || p_equipment || '/' || p_tbox_type || '. Classifier workflow triggered.',
             'tbox_type', p_tbox_type,
             'tenant_id', v_tenant_id,
             'equipment', p_equipment,
@@ -242,34 +229,21 @@ BEGIN
         );
     END IF;
 
-    -- Get RawTag IDs that are classified to this type, optionally filtered by equipment
-    IF p_equipment IS NOT NULL THEN
-        v_sql := format(
-            $sql$SELECT array_agg(id::text) FROM (
-                SELECT id FROM ag_catalog.cypher('platform', $cypher$
-                    MATCH (r:RawTag)-[:IS_TYPE_OF {status: 'approved'}]->(p:PropertyDef {name: %L}),
-                          (r)-[:BELONGS_TO]->(e:Equipment {id: %L})
-                    RETURN r.id AS id
-                $cypher$) AS (id agtype)
-            ) sub$sql$,
-            p_tbox_type,
-            v_tenant_id || ':' || p_equipment
-        );
-    ELSE
-        v_sql := format(
-            $sql$SELECT array_agg(id::text) FROM (
-                SELECT id FROM ag_catalog.cypher('platform', $cypher$
-                    MATCH (r:RawTag {building_id: %L})-[:IS_TYPE_OF {status: 'approved'}]->(p:PropertyDef {name: %L})
-                    RETURN r.id AS id
-                $cypher$) AS (id agtype)
-            ) sub$sql$,
-            v_tenant_id,
-            p_tbox_type
-        );
-    END IF;
+    -- Get RawTag IDs classified to this type on this equipment
+    v_sql := format(
+        $sql$SELECT array_agg(id::text) FROM (
+            SELECT id FROM ag_catalog.cypher('platform', $cypher$
+                MATCH (r:RawTag)-[:IS_TYPE_OF {status: 'approved'}]->(p:PropertyDef {name: %L}),
+                      (r)-[:BELONGS_TO]->(e:Equipment {id: %L})
+                RETURN r.id AS id
+            $cypher$) AS (id agtype)
+        ) sub$sql$,
+        p_tbox_type,
+        v_tenant_id || ':' || p_equipment
+    );
     EXECUTE v_sql INTO v_rawtag_ids;
 
-    -- Query readings by rawtag_id (handle NULL/empty array)
+    -- Query readings by rawtag_id
     IF v_rawtag_ids IS NULL OR array_length(v_rawtag_ids, 1) IS NULL THEN
         v_rawtag_ids := ARRAY[]::TEXT[];
     END IF;
@@ -301,6 +275,35 @@ END;
 $$ LANGUAGE plpgsql VOLATILE SECURITY DEFINER;
 
 GRANT EXECUTE ON FUNCTION evoiot.get_readings_by_type TO postgrest_role, postgrest_anon, ai_reader, workflow_rw;
+
+-- Trigger equipment discovery workflow
+CREATE OR REPLACE FUNCTION evoiot.discover_equipment(
+    p_tenant_id TEXT
+) RETURNS jsonb AS $$
+DECLARE
+    v_tenant_id TEXT;
+BEGIN
+    v_tenant_id := COALESCE(p_tenant_id,
+        current_setting('request.jwt.claims', true)::json->>'tenant_id',
+        'default');
+
+    PERFORM net.http_post(
+        url := 'http://restate:8080/equipment_discovery/' ||
+               encode(convert_to(v_tenant_id, 'UTF8'), 'base64') ||
+               '/run',
+        body := jsonb_build_object('tenant_id', v_tenant_id),
+        headers := '{"Content-Type": "application/json"}'::jsonb
+    );
+
+    RETURN jsonb_build_object(
+        'status', 'discovery_started',
+        'message', 'Equipment discovery workflow triggered for tenant ' || v_tenant_id,
+        'tenant_id', v_tenant_id
+    );
+END;
+$$ LANGUAGE plpgsql VOLATILE SECURITY DEFINER;
+
+GRANT EXECUTE ON FUNCTION evoiot.discover_equipment TO postgrest_role, postgrest_anon, ai_reader, workflow_rw;
 
 -- List equipment for a tenant, with device type and classified point types
 CREATE OR REPLACE FUNCTION evoiot.list_equipment(

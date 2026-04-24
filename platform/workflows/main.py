@@ -2,9 +2,10 @@
 
 import restate
 from classifier import classification_workflow
+from discovery import equipment_discovery_workflow
 
 # Create the Restate app with all workflows
-app = restate.app(services=[classification_workflow])
+app = restate.app(services=[classification_workflow, equipment_discovery_workflow])
 
 if __name__ == "__main__":
     import hypercorn.asyncio
