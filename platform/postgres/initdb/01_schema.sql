@@ -171,6 +171,7 @@ GRANT SELECT ON evoiot.data_sources TO postgrest_anon;
 CREATE OR REPLACE FUNCTION evoiot.get_readings_by_type(
     p_tbox_type TEXT,
     p_tenant_id TEXT DEFAULT null,
+    p_equipment TEXT DEFAULT null,
     p_start TIMESTAMPTZ DEFAULT now() - interval '1 hour',
     p_end TIMESTAMPTZ DEFAULT now()
 ) RETURNS jsonb AS $$
@@ -191,15 +192,31 @@ BEGIN
         'default');
 
     -- Check if any RawTag has approved IS_TYPE_OF edge to this type
-    v_sql := format(
-        $sql$SELECT EXISTS (
-            SELECT 1 FROM ag_catalog.cypher('platform', $cypher$
-                MATCH (r:RawTag)-[e:IS_TYPE_OF {status: 'approved'}]->(p:PropertyDef {name: %L})
-                RETURN r.id LIMIT 1
-            $cypher$) AS (id agtype)
-        )$sql$,
-        p_tbox_type
-    );
+    -- Scoped to tenant to avoid cross-tenant false positives
+    IF p_equipment IS NOT NULL THEN
+        v_sql := format(
+            $sql$SELECT EXISTS (
+                SELECT 1 FROM ag_catalog.cypher('platform', $cypher$
+                    MATCH (r:RawTag)-[:IS_TYPE_OF {status: 'approved'}]->(p:PropertyDef {name: %L}),
+                          (r)-[:BELONGS_TO]->(e:Equipment {id: %L})
+                    RETURN r.id LIMIT 1
+                $cypher$) AS (id agtype)
+            )$sql$,
+            p_tbox_type,
+            v_tenant_id || ':' || p_equipment
+        );
+    ELSE
+        v_sql := format(
+            $sql$SELECT EXISTS (
+                SELECT 1 FROM ag_catalog.cypher('platform', $cypher$
+                    MATCH (r:RawTag {building_id: %L})-[:IS_TYPE_OF {status: 'approved'}]->(p:PropertyDef {name: %L})
+                    RETURN r.id LIMIT 1
+                $cypher$) AS (id agtype)
+            )$sql$,
+            v_tenant_id,
+            p_tbox_type
+        );
+    END IF;
     EXECUTE v_sql INTO v_has_classification;
 
     -- If no classification, trigger classifier workflow (async via pg_net)
@@ -220,20 +237,36 @@ BEGIN
             'message', 'No approved classification found for ' || p_tbox_type || '. Classifier workflow triggered.',
             'tbox_type', p_tbox_type,
             'tenant_id', v_tenant_id,
+            'equipment', p_equipment,
             'data', '[]'::jsonb
         );
     END IF;
 
-    -- Get RawTag IDs that are classified to this type
-    v_sql := format(
-        $sql$SELECT array_agg(id::text) FROM (
-            SELECT id FROM ag_catalog.cypher('platform', $cypher$
-                MATCH (r:RawTag)-[e:IS_TYPE_OF {status: 'approved'}]->(p:PropertyDef {name: %L})
-                RETURN r.id AS id
-            $cypher$) AS (id agtype)
-        ) sub$sql$,
-        p_tbox_type
-    );
+    -- Get RawTag IDs that are classified to this type, optionally filtered by equipment
+    IF p_equipment IS NOT NULL THEN
+        v_sql := format(
+            $sql$SELECT array_agg(id::text) FROM (
+                SELECT id FROM ag_catalog.cypher('platform', $cypher$
+                    MATCH (r:RawTag)-[:IS_TYPE_OF {status: 'approved'}]->(p:PropertyDef {name: %L}),
+                          (r)-[:BELONGS_TO]->(e:Equipment {id: %L})
+                    RETURN r.id AS id
+                $cypher$) AS (id agtype)
+            ) sub$sql$,
+            p_tbox_type,
+            v_tenant_id || ':' || p_equipment
+        );
+    ELSE
+        v_sql := format(
+            $sql$SELECT array_agg(id::text) FROM (
+                SELECT id FROM ag_catalog.cypher('platform', $cypher$
+                    MATCH (r:RawTag {building_id: %L})-[:IS_TYPE_OF {status: 'approved'}]->(p:PropertyDef {name: %L})
+                    RETURN r.id AS id
+                $cypher$) AS (id agtype)
+            ) sub$sql$,
+            v_tenant_id,
+            p_tbox_type
+        );
+    END IF;
     EXECUTE v_sql INTO v_rawtag_ids;
 
     -- Query readings by rawtag_id (handle NULL/empty array)
@@ -245,6 +278,7 @@ BEGIN
         'status', 'ok',
         'tbox_type', p_tbox_type,
         'tenant_id', v_tenant_id,
+        'equipment', p_equipment,
         'rawtag_ids', to_jsonb(v_rawtag_ids),
         'data', COALESCE(
             (SELECT jsonb_agg(jsonb_build_object(
