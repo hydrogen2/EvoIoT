@@ -16,7 +16,10 @@ services:
       POSTGRES_DB: postgres
     command:
       - "-c"
-      - "shared_preload_libraries=timescaledb,age,pg_net"
+      # age is NOT preloaded: its hooks would load into every DB session
+      # (including Zitadel's own database, which lacks ag_catalog and crashes
+      # on migration). All platform SQL does an explicit LOAD 'age' instead.
+      - "shared_preload_libraries=timescaledb,pg_net"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
@@ -167,6 +170,8 @@ services:
     command: start-from-init --masterkeyFromEnv --tlsMode disabled
     environment:
       ZITADEL_MASTERKEY: "evoiot-masterkey-exactly32chars!"
+      # lets `zitadel ready` (healthcheck) probe over plain HTTP
+      ZITADEL_TLS_ENABLED: "false"
       ZITADEL_DATABASE_POSTGRES_HOST: postgres
       ZITADEL_DATABASE_POSTGRES_PORT: 5432
       ZITADEL_DATABASE_POSTGRES_DATABASE: zitadel
@@ -190,7 +195,8 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/debug/healthz"]
+      # distroless image: no wget/curl — use zitadel's built-in readiness probe
+      test: ["CMD", "/app/zitadel", "ready"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -217,7 +223,9 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:4000/health"]
+      # no curl in image; /health requires an API key — probe the
+      # unauthenticated liveliness endpoint with python instead
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness')"]
       interval: 10s
       timeout: 5s
       retries: 5
