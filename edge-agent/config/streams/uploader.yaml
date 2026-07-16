@@ -38,7 +38,7 @@ output:
     outputs:
       - mqtt:
           urls:
-            - tcp://mosquitto:1883
+            - "${MQTT_URL:tcp://mosquitto:1883}"
           topic: 'buildings/${! json("building_id") }/agents/${! json("source_id") }/telemetry'
           qos: 1
           client_id: "edge-agent-uploader"

@@ -47,7 +47,7 @@ pipeline:
 output:
   mqtt:
     urls:
-      - tcp://mosquitto:1883
+      - "${MQTT_URL:tcp://mosquitto:1883}"
     topic: 'buildings/${! json("building_id") }/agents/${! json("source_id") }/discovery'
     qos: 1
     retained: true
