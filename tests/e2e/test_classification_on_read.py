@@ -30,7 +30,8 @@ DEVICE_ID = "9001"
 
 
 def _b64(s: str) -> str:
-    return base64.b64encode(s.encode()).decode()
+    # Must match evoiot.b64url() in the schema: urlsafe, no padding
+    return base64.urlsafe_b64encode(s.encode()).decode().rstrip("=")
 
 
 @pytest.fixture(scope="module")

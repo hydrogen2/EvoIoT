@@ -167,6 +167,17 @@ GRANT SELECT ON evoiot.data_sources TO postgrest_anon;
 -- Functions
 -- =============================================================================
 
+-- URL-safe base64 for Restate workflow keys embedded in URL paths.
+-- Postgres encode(...,'base64') wraps lines every 76 chars and emits +/=,
+-- all of which break URLs. Callers computing the same key (e.g. tests)
+-- must use urlsafe base64 without padding.
+CREATE OR REPLACE FUNCTION evoiot.b64url(p TEXT) RETURNS TEXT AS $$
+    SELECT translate(encode(convert_to(p, 'UTF8'), 'base64'),
+                     '+/=' || chr(10) || chr(13), '-_');
+$$ LANGUAGE sql IMMUTABLE;
+
+GRANT EXECUTE ON FUNCTION evoiot.b64url TO postgrest_role, postgrest_anon, ai_reader, workflow_rw;
+
 -- Function to get readings by ontology type with classification-on-read
 CREATE OR REPLACE FUNCTION evoiot.get_readings_by_type(
     p_equipment TEXT,
@@ -209,7 +220,7 @@ BEGIN
     IF NOT v_has_classification THEN
         PERFORM net.http_post(
             url := 'http://restate:8080/classifier/' ||
-                   encode(convert_to(v_tenant_id || ':' || p_equipment || ':' || p_tbox_type, 'UTF8'), 'base64') ||
+                   evoiot.b64url(v_tenant_id || ':' || p_equipment || ':' || p_tbox_type) ||
                    '/run',
             body := jsonb_build_object(
                 'tenant_id', v_tenant_id,
@@ -289,7 +300,7 @@ BEGIN
 
     PERFORM net.http_post(
         url := 'http://restate:8080/equipment_discovery/' ||
-               encode(convert_to(v_tenant_id, 'UTF8'), 'base64') ||
+               evoiot.b64url(v_tenant_id) ||
                '/run',
         body := jsonb_build_object('tenant_id', v_tenant_id),
         headers := '{"Content-Type": "application/json"}'::jsonb
