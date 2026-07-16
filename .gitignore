@@ -8,3 +8,7 @@ __pycache__/
 # Built binaries
 platform/bento-custom/bento-custom.exe
 platform/bento-custom/bento-linux
+
+# claude-shim runtime files (secret token, logs)
+platform/claude-shim/.token
+platform/claude-shim/*.log

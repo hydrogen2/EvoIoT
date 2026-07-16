@@ -142,10 +142,15 @@ services:
       POSTGRES_DB: postgres
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-      # Volcengine Doubao via LiteLLM (OpenAI-compatible)
-      LLM_MODEL: openai/doubao-seed-2.0-code
-      LLM_API_BASE: https://ark.cn-beijing.volces.com/api/coding/v3
+      # LLM backend via LiteLLM (OpenAI-compatible endpoint).
+      # Currently the claude-shim on the docker host (platform/claude-shim/),
+      # which fronts the Claude Code CLI. LLM_API_KEY doubles as the shim's
+      # bearer token (SHIM_TOKEN).
+      LLM_MODEL: ${LLM_MODEL:-openai/claude-code}
+      LLM_API_BASE: ${LLM_API_BASE:-http://host.docker.internal:8787/v1}
       LLM_API_KEY: ${LLM_API_KEY}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy
