@@ -102,16 +102,26 @@ def test_classification_on_read(seeded_data, api, restate, db):
     assert r.json()["status"] == "discovery_started"
 
     # ---------------------------------------------------------------
-    # Step 2: Wait for Equipment to appear (LLM call in flight)
+    # Step 2: Wait for Equipment to appear (LLM call in flight).
+    # The LLM may create several equipment groups (e.g. one from the
+    # device-level tag) — pick the one our RawTag BELONGS_TO, since
+    # that is the scope the classifier will search in.
     # ---------------------------------------------------------------
     equipment = None
     for attempt in range(60):
-        r = api.post("/rpc/list_equipment", json={"p_tenant_id": TENANT})
-        assert r.status_code == 200, f"list_equipment failed: {r.text}"
-        rows = r.json()
-        if rows:
-            equipment = rows[0]["equipment"]
-            break
+        with db.cursor() as cur:
+            cur.execute("LOAD 'age'")
+            cur.execute("SET search_path = ag_catalog, evoiot, public")
+            cur.execute(f"""
+                SELECT name FROM cypher('platform', $$
+                    MATCH (r:RawTag {{id: '{rawtag_id}'}})-[:BELONGS_TO]->(e:Equipment)
+                    RETURN e.name
+                $$) AS (name agtype)
+            """)
+            row = cur.fetchone()
+            if row:
+                equipment = str(row[0]).strip('"')
+                break
         time.sleep(3)
 
     assert equipment is not None, (
@@ -153,6 +163,11 @@ def test_classification_on_read(seeded_data, api, restate, db):
             if mine:
                 proposals = mine
                 break
+        # Fail fast if the workflow already completed without proposals
+        # (LLM matched nothing) instead of polling out the full timeout.
+        out = restate.get(f"/restate/workflow/classifier/{workflow_id}/output")
+        if out.status_code == 200 and out.json().get("status") == "completed":
+            pytest.fail(f"Classifier completed without proposals: {out.json()}")
         time.sleep(2)
 
     assert len(proposals) > 0, (
