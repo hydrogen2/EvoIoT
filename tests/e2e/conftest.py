@@ -11,6 +11,7 @@ The fixtures manage the full docker compose lifecycle:
   - session end:   docker compose down -v
 """
 
+import base64
 import json
 import os
 import subprocess
@@ -20,6 +21,16 @@ import httpx
 import paho.mqtt.client as mqtt
 import psycopg2
 import pytest
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--purge-test-tenants", action="store_true", default=False,
+        help="After the session, delete everything created by test-e2e "
+             "tenants: graph nodes, readings, events, and Restate "
+             "invocation state. Use with E2E_MANAGE_STACK=0 to keep a "
+             "live stack clean across runs.",
+    )
 
 # ---------------------------------------------------------------------------
 # Config
@@ -110,6 +121,99 @@ def stack():
     if manage_stack:
         # Tear down
         _compose("down", "-v", check=False, timeout=60)
+
+
+# ---------------------------------------------------------------------------
+# Test-tenant purge (opt-in via --purge-test-tenants)
+# ---------------------------------------------------------------------------
+TEST_TENANT_PREFIX = "test-e2e"
+# Workflow keys are urlsafe base64 of "test-e2e-...", so they share this prefix
+_B64_TENANT_PREFIX = base64.b64encode(TEST_TENANT_PREFIX.encode()).decode().rstrip("=")
+
+
+def _purge_test_tenants(session_started_at):
+    """Delete all test-tenant residue. Uses its own connections so it does not
+    depend on fixture teardown ordering."""
+    like = TEST_TENANT_PREFIX + "%"
+    conn = psycopg2.connect(POSTGRES_DSN)
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            # Graph: RawTag + Equipment nodes (and their edges) for test tenants
+            cur.execute("LOAD 'age'")
+            cur.execute("SET search_path = ag_catalog, evoiot, public")
+            cur.execute(f"""
+                SELECT * FROM cypher('platform', $$
+                    MATCH (r:RawTag) WHERE r.building_id STARTS WITH '{TEST_TENANT_PREFIX}'
+                    DETACH DELETE r
+                $$) AS (x agtype)
+            """)
+            cur.execute(f"""
+                SELECT * FROM cypher('platform', $$
+                    MATCH (e:Equipment) WHERE e.id STARTS WITH '{TEST_TENANT_PREFIX}'
+                    DETACH DELETE e
+                $$) AS (x agtype)
+            """)
+
+            cur.execute("DELETE FROM evoiot.readings WHERE tenant_id LIKE %s", (like,))
+            deleted_readings = cur.rowcount
+
+            # Events referencing test tenants directly, via base64 workflow
+            # keys, or in payloads — plus anonymous Bento processor spans
+            # emitted during this session (noise from processing test messages).
+            cur.execute(
+                """DELETE FROM evoiot.events
+                   WHERE data_id LIKE %s OR trace_id LIKE %s
+                      OR data_id LIKE %s OR trace_id LIKE %s
+                      OR payload::text LIKE %s
+                      OR (component = 'bento' AND data_id IS NULL
+                          AND event_time >= %s)""",
+                (like, like, _B64_TENANT_PREFIX + "%", _B64_TENANT_PREFIX + "%",
+                 "%" + TEST_TENANT_PREFIX + "%", session_started_at),
+            )
+            deleted_events = cur.rowcount
+    finally:
+        conn.close()
+
+    # Restate: purge invocation state for test-tenant workflow keys
+    purged = 0
+    try:
+        r = httpx.post(
+            f"{RESTATE_ADMIN_URL}/query",
+            json={"query": "SELECT id, target FROM sys_invocation"},
+            headers={"Accept": "application/json"},
+            timeout=10,
+        )
+        for row in r.json().get("rows", []):
+            if "/" + _B64_TENANT_PREFIX in row.get("target", ""):
+                for mode in ("purge", "kill"):
+                    resp = httpx.delete(
+                        f"{RESTATE_ADMIN_URL}/invocations/{row['id']}?mode={mode}",
+                        timeout=10,
+                    )
+                    if resp.status_code < 300:
+                        purged += 1
+                        break
+    except httpx.HTTPError as e:
+        print(f"[purge] Restate purge skipped: {e}")
+
+    print(f"[purge] test tenants removed: {deleted_readings} readings, "
+          f"{deleted_events} events, {purged} Restate invocations, "
+          f"graph nodes for '{TEST_TENANT_PREFIX}*'")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def purge_test_tenants(request, stack):
+    """Optionally wipe all test-tenant data after the session.
+
+    Depends on `stack` so its teardown runs BEFORE the stack is torn down.
+    Pointless with E2E_MANAGE_STACK=1 (down -v wipes volumes anyway), but
+    harmless there; intended for runs against a persistent stack.
+    """
+    session_started_at = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+    yield
+    if request.config.getoption("--purge-test-tenants"):
+        _purge_test_tenants(session_started_at)
 
 
 @pytest.fixture(scope="session")
