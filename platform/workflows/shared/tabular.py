@@ -140,7 +140,10 @@ def apply_mapping(sheets, spec: dict):
         device_id = device_name
         if inst_re:
             m = inst_re.search(device_name)
-            if m:
+            # Guard against name-suffix false positives (SC-equip-App1 → "1"):
+            # a trailing number is only a BACnet instance if a separator
+            # precedes it (Rivervale_Chiller_7777 → 7777).
+            if m and m.start(1) > 0 and device_name[m.start(1) - 1] in "_- ":
                 device_id = m.group(1)
 
         unit = cell(row, "unit") or None
