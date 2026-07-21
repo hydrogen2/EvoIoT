@@ -39,6 +39,62 @@ Group all raw tags by equipment. Return a JSON array of equipment objects:
   ...
 ]"""
 
+# ── File Understanding (extraction) ─────────────────────────────────
+
+SUMMARIZE_FILE_PROMPT = """You are cataloging files from a building-management project folder.
+Given a filename and a content sample, describe the file in ONE sentence:
+what it is, what it contains, and roughly how much (e.g. "Niagara BACnet
+point export: 929 points across 4 devices for Rivervale Plaza").
+Respond with the sentence only — no JSON, no markdown."""
+
+TABLE_MAPPING_SYSTEM_PROMPT = """You are an expert at reading BMS/BACnet point-list exports (Niagara, Desigo, Metasys, generic CSV).
+
+Given the header and sample rows of a spreadsheet, produce a column mapping spec identifying which columns carry which roles. Respond in JSON only:
+
+{
+  "sheet": "<sheet name to extract>",
+  "columns": {
+    "device":    "<column with the source device/controller name, or null>",
+    "object_id": "<column with the BACnet object identifier like analogInput:0 or AI,1>",
+    "name":      "<column with the point name>",
+    "facets":    "<column with Niagara facets (contains units=u:...), or null>",
+    "unit":      "<column with a plain engineering unit, or null>",
+    "value":     "<column with a current/sample value, or null>",
+    "write":     "<column indicating writability, or null>",
+    "path":      "<column with a station path, or null>"
+  },
+  "device_instance_regex": "<regex whose group 1 captures the numeric BACnet device instance from the device name, or null if not derivable>"
+}
+
+Rules:
+- Column values must be EXACT header strings from the sample, or null.
+- object_id and name are required — pick the best candidates.
+- Prefer a facets column over a plain unit column when both exist."""
+
+TABLE_MAPPING_USER_TEMPLATE = """## File: {filename}
+
+## Content sample (CSV):
+{sample}
+
+Produce the column mapping spec JSON."""
+
+
+def summarize_file(filename: str, sample: str) -> str:
+    """One-line description of a file from its content sample."""
+    content = _call_llm(SUMMARIZE_FILE_PROMPT,
+                        f"## File: {filename}\n\n{sample}", max_tokens=200)
+    return content.strip().strip('"')
+
+
+def propose_table_mapping(filename: str, sample: str) -> dict:
+    """Ask the LLM for a column mapping spec for a tabular point export."""
+    content = _call_llm(
+        TABLE_MAPPING_SYSTEM_PROMPT,
+        TABLE_MAPPING_USER_TEMPLATE.format(filename=filename, sample=sample),
+    )
+    return json.loads(content)
+
+
 # ── Point Classification ────────────────────────────────────────────
 
 CLASSIFY_SYSTEM_PROMPT = """You are an expert at classifying building automation system (BAS) data points.

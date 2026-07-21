@@ -536,7 +536,10 @@ CREATE OR REPLACE FUNCTION evoiot.upsert_rawtag(
     p_tag_type TEXT DEFAULT 'object',      -- 'device' or 'object'
     p_raw_data TEXT DEFAULT NULL,
     p_discovered_at TEXT DEFAULT NULL,
-    p_last_seen_by TEXT DEFAULT NULL
+    p_last_seen_by TEXT DEFAULT NULL,
+    p_origin TEXT DEFAULT 'wire',           -- 'wire' (observed) | 'file' (claimed by evidence)
+    p_evidence TEXT DEFAULT NULL,           -- provenance fragment, e.g. file:sha#Sheet!r5
+    p_building TEXT DEFAULT NULL            -- building hint (a belief, e.g. from folder position)
 ) RETURNS TEXT AS $$
 DECLARE
     v_template TEXT;
@@ -590,6 +593,9 @@ BEGIN
                 r.raw_data = CASE WHEN %L <> '' THEN %L ELSE COALESCE(r.raw_data, '') END,
                 r.discovered_at = CASE WHEN %L <> '' THEN %L ELSE COALESCE(r.discovered_at, '') END,
                 r.last_seen_by = CASE WHEN %L <> '' THEN %L ELSE COALESCE(r.last_seen_by, '') END,
+                r.origin = CASE WHEN r.origin = 'wire' OR %L = 'wire' THEN 'wire' ELSE %L END,
+                r.evidence = CASE WHEN %L <> '' THEN %L ELSE COALESCE(r.evidence, '') END,
+                r.building = CASE WHEN %L <> '' THEN %L ELSE COALESCE(r.building, '') END,
                 r.updated_at = %L
         $cypher$) AS (r agtype)
     $sql$,
@@ -604,6 +610,9 @@ BEGIN
         v_raw_data_safe, v_raw_data_safe,
         COALESCE(p_discovered_at, ''), COALESCE(p_discovered_at, ''),
         COALESCE(p_last_seen_by, ''), COALESCE(p_last_seen_by, ''),
+        COALESCE(p_origin, 'wire'), COALESCE(p_origin, 'wire'),
+        COALESCE(p_evidence, ''), COALESCE(p_evidence, ''),
+        COALESCE(p_building, ''), COALESCE(p_building, ''),
         extract(epoch from now())::bigint * 1000
     );
 
@@ -621,7 +630,9 @@ BEGIN
             'object_type', p_object_type,
             'object_instance', p_object_instance,
             'tag_type', p_tag_type,
-            'raw_data', p_raw_data
+            'raw_data', p_raw_data,
+            'origin', COALESCE(p_origin, 'wire'),
+            'evidence', p_evidence
         )
     );
 
