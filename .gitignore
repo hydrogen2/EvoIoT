@@ -12,3 +12,6 @@ platform/bento-custom/bento-linux
 # claude-shim runtime files (secret token, logs)
 platform/claude-shim/.token
 platform/claude-shim/*.log
+
+# Real project material (customer data) - not for the repo
+tests/projects/
