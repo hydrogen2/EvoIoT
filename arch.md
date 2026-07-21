@@ -36,6 +36,44 @@ Minimal seed apps + minimal seed TBox. Users grow the system by asking questions
 
 ---
 
+## Core Loop — Query-Driven Resolution
+
+There is no one-off, aim-for-perfection, god's-eye-view onboarding process. The platform connects to data sources — the BACnet live stream, a watched project folder, external APIs — and then **queries drive understanding backward through the layers, like backpropagation**, with the graph consolidating discoveries along the way. Always start from something small but working, then grow incrementally: easy queries are satisfied first, and every answered query consolidates understanding that brings harder ones within reach.
+
+Every query walks a resolution chain; each miss propagates one layer deeper:
+
+```
+Query: "AHU-1 supply air temp, last week"
+  │
+  ├─ 1. Graph has an approved answer?        → serve it            (cache hit)
+  │
+  ├─ 2. Existing evidence can answer it?     → LLM over RawTags +
+  │      (names, folder docs, graphics)        evidence → propose → ratify
+  │
+  ├─ 3. A connected source could produce it? → invoke: edge ops-proxy scan,
+  │                                            re-read folder, sample values
+  │
+  └─ 4. Nothing can?                         → visible gap:
+                                               "add a sensor / file / source?"
+```
+
+Each resolution is **consolidated into the graph on the way back up**, so the next query short-circuits at layer 1. The graph is not a model built up front — it is a memoization layer for answered questions. The query is the training signal, the graph holds the learned weights, and the data sources are the ground truth the platform reaches back into only when cached understanding cannot serve demand.
+
+Three properties keep this honest:
+
+- **Graph entries are consolidated beliefs, not facts.** Each carries confidence and provenance (which evidence, which query drove it, who ratified it). New evidence does not trigger re-onboarding; it means layer 2 has more to work with the next time a query misses — and can revise an earlier consolidation it contradicts.
+- **The bottom of the chain is a feature.** A query that exhausts all resolvers produces "you should have X but don't" — gaps surface exactly when someone cares, ranked by real demand rather than a commissioning checklist.
+- **Async-first UX.** Resolvers below layer 1 are slow (LLM calls, live scans). The API answers "pending, here's why, here's what's happening" (`classification_pending`) rather than blocking.
+
+Every capability in this document is a resolver in this chain. Classification-on-read is the chain with one resolver (LLM over RawTag names). Folder evidence, graphics parsing, and the edge ops proxy are additional resolvers, consulted in cost order (cache → cheap evidence → LLM fusion → live probe → human).
+
+The system grows along two axes, and never by re-architecting:
+
+- **Demand (primary):** easy queries first — a well-named point, an obvious classification. Each consolidation makes harder, multi-hop queries answerable: "chiller plant efficiency" becomes tractable once power, flow, and temperatures have each been resolved by earlier, simpler queries.
+- **Capability:** adding resolvers and source types extends how deep the chain can reach when demand outruns what existing sources can answer.
+
+---
+
 ## Core Philosophy
 
 ### Immutable raw data
@@ -180,6 +218,27 @@ This means:
 - **System grows toward completeness**, guided by domain best practices
 
 The AI helps users explore what's *meaningful*, not just what's *available*.
+
+### Multi-source evidence, continuous onboarding
+
+Raw BACnet discovery alone cannot carry onboarding: it is noisy (BMS-internal points, unused template objects) and lacks context (no equipment grouping, cryptic names). Understanding is drawn from **all evidence sources together**:
+
+```
+A. BMS point exports         authoritative names, units, addresses
+   (Excel / CSV / PDF)
+B. BMS graphics & documents  equipment groupings, human labels, locations
+   (screenshots, HMI pages, handwritten notes, folder names)
+C. Raw BACnet discovery      ground truth of what is actually addressable
+   (via edge ops proxy, on demand, scoped)
+D. Telemetry itself          value distributions, new points appearing,
+                             points going silent
+```
+
+Evidence extraction is LLM-based by necessity — the material is wildly diverse (xlsx, PDFs, JPG screenshots, device names encoded in folder names, photos of handwritten notes). Each file yields structured claims with provenance ("device 12 is AHU-1", "AHU-1 serves floor 3"), which are diffed against the current graph; proposals are raised only where understanding changes, then human-ratified through the same review flow as classification.
+
+Cross-referencing filters discovery noise structurally: a point present on the wire (C) but absent from every export and graphic (A, B) is probably BMS plumbing — it stays dark until a query asks for it. An export row with no live counterpart surfaces as "configured but not reachable".
+
+**The project folder is a data source, not an import step.** It is registered in `data_sources` (e.g. a watched folder / SharePoint) and monitored continuously: dropping a complete project folder on day 1 and adding a single commissioning report on day 400 are the same operation. Telemetry feeds the same loop — a classification contradicted by observed values (a "temperature" that only ever reads 0/1) raises a revision proposal like any other new evidence.
 
 ### Open ingestion layer
 Sensor data and external API data are unified — they differ only in how they arrive. The platform ships with defaults (MQTT for edge agent sensor data, pre-built pipeline templates for common APIs) but the ingestion layer is fully open: users and AI can register any data source via the `data_sources` registry. Bento dynamically spawns pipelines for new entries. All data flows through the same normalisation and classification loop regardless of origin.
@@ -491,16 +550,34 @@ The tradeoff: AGE implements a subset of openCypher and is not as performant as 
 ## Edge Agent
 
 ### Philosophy
-The edge agent is a syncer. It synchronises ALL devices and readings from the BMS network to the platform. It decides nothing — no filtering, no classification, no interpretation. It is a faithful witness to the physical network.
+The platform is the brain; the edge agent is an executor with a cache. It carries two responsibilities:
 
 ```
-Edge agent decides:    HOW to read (poll interval, batch size, retry)
-                       WHEN to read (schedule, discovery timing)
+1. Live data transmission   autonomous, buffered, always-on:
+                            poll → SQLite → Bento → MQTT
 
-Edge agent never:      WHAT to read (reads everything it finds)
-                       WHAT it means (platform classifies)
-                       WHETHER to store (always forwards all)
+2. BACnet ops proxy         passive until invoked by the platform:
+                            scan (scoped), read (any property),
+                            write (command path) — the platform calls
+                            these freely as part of its exploration
+                            (resolution-chain layer 3)
 ```
+
+The interaction surface is deliberately minimal. The complexity of platform-edge architectures comes from making the edge a stateful peer — config sync protocols, version negotiation, mutual state tracking. Here there are two primitives, and **the edge never tracks sync state**:
+
+```
+Edge → platform    fire-and-forget streams (telemetry, scan results,
+                   op responses). SQLite-buffered, at-least-once.
+
+Platform → edge    idempotent request/response ops over MQTT.
+                   Restate owns all invocation state (awakeable,
+                   timeout, retry). Poll config is re-asserted
+                   declaratively as a whole (last-write-wins) —
+                   never diff-synced. The edge caches the last
+                   asserted config in SQLite and executes.
+```
+
+The edge still decides HOW to read (poll interval, batching, retry) and never interprets meaning. WHAT to poll is platform-asserted — defaulting to everything confirmed by evidence, narrowed or widened as exploration demands.
 
 ### Architecture: Producer → Queue → Consumer
 
@@ -567,9 +644,10 @@ edge-agent/
   docker-compose.yaml
 ```
 
-### Discovery flow
+### Scan flow (ops-proxy invoked)
 
 ```
+0. Platform invokes the scan op (exploration, or a platform-scheduled rescan)
 1. discover.py runs BACnet Who-Is broadcast (BAC0 async)
 2. Waits for I-Am responses, collects device addresses
 3. For each device: ReadPropertyMultiple to enumerate objects
@@ -582,8 +660,8 @@ edge-agent/
 ```
 
 ### Polling
-- `poller.py` polls every BACnet object on every discovered device
-- No enumeration in config — reads everything found in SQLite
+- `poller.py` polls the platform-asserted poll list (cached in SQLite;
+  defaults to every object on every discovered device)
 - Poll interval by object type category (analog-input: 60s, binary: 30s, etc.)
 - Readings written to SQLite with `uploaded=0`
 - Bento uploader stream: SELECT WHERE uploaded=0, publish, UPDATE uploaded=1
@@ -593,7 +671,8 @@ edge-agent/
 - WAL mode enables concurrent read (Bento) + write (Python) without locking
 - Survives network outages — readings accumulate until connectivity restored
 - Survives process restarts — Bento resumes from last uploaded reading
-- Future: config table for runtime-adjustable poll intervals, object filters
+- Config table holds the platform-asserted poll list and intervals
+  (re-asserted whole by the platform, cached here)
 
 ### Timestamp provenance
 BACnet and Modbus carry no timestamps. The edge agent's read time (`agent_read_at`) is the best available approximation of valid time. Every raw reading includes:
@@ -1090,6 +1169,12 @@ Every step has a who, what, when, and why. No gaps.
 ## Development Sequence
 
 Always runnable from day one. Each step adds features without breaking what exists.
+
+> **Status (2026-07):** steps 1–7 are built and passing e2e, with equipment
+> discovery added as a separate workflow between steps 5 and 6. The remaining
+> steps are being re-planned around the query-driven resolution chain:
+> multi-source evidence ingestion (watched project folder) and the edge ops
+> proxy come before rules, lens, and command dispatch.
 
 **Step 1 — Postgres schema + docker-compose skeleton**
 All services in docker-compose, none doing anything meaningful yet. Postgres initialises with full DDL — all tables, RLS policies, Postgres roles, AGE graph labels and edge types, TimescaleDB hypertable, partial indexes. Zitadel, PostgREST, Mosquitto, Bento, Restate, Prometheus, Grafana, Loki all start.
