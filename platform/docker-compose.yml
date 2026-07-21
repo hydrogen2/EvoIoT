@@ -149,8 +149,14 @@ services:
       LLM_MODEL: ${LLM_MODEL:-openai/claude-code}
       LLM_API_BASE: ${LLM_API_BASE:-http://host.docker.internal:8787/v1}
       LLM_API_KEY: ${LLM_API_KEY}
+      FILE_STORE: /data/file_store
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    volumes:
+      # watched file sources (data_sources.config.path is a container path)
+      - ../tests/projects:/projects:ro
+      # content-addressed snapshots of cataloged file versions
+      - file_store:/data/file_store
     depends_on:
       postgres:
         condition: service_healthy
@@ -384,3 +390,4 @@ volumes:
   prometheus_data:
   grafana_data:
   loki_data:
+  file_store:

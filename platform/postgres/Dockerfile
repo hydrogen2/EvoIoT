@@ -1,4 +1,6 @@
-FROM timescale/timescaledb:latest-pg16
+# Pinned: the latest-pg16 tag moves and has repeatedly broken rebuilds
+# (clang version drift, surprise multi-GB pulls). Matches the deployed stack.
+FROM timescale/timescaledb:2.28.2-pg16
 
 # Install build dependencies for Apache AGE and pg_net
 # with_llvm=no skips LLVM JIT bitcode generation, which would require the exact

@@ -60,6 +60,32 @@ CREATE TABLE evoiot.data_sources (
     CONSTRAINT valid_classification CHECK (classification IN ('classified', 'pending', 'rejected'))
 );
 
+-- Files catalog (source_type='file' data sources: watched folders, uploads...)
+-- The catalog records only what is invariant for ANY file: bytes at a path.
+-- Identity is (source_id, relpath, sha256) — an edited file is a NEW immutable
+-- version at the same path; is_current marks the latest version per path.
+-- Everything below file level (sheets, image regions) belongs to extraction,
+-- which references catalog rows via provenance fragments.
+CREATE TABLE evoiot.files (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source_id   UUID NOT NULL REFERENCES evoiot.data_sources(id),
+    tenant_id   TEXT NOT NULL,              -- isolation only, inherited from source
+    relpath     TEXT NOT NULL,              -- path relative to the source root
+    sha256      TEXT NOT NULL,
+    size_bytes  BIGINT NOT NULL,
+    file_mtime  TIMESTAMPTZ,
+    first_seen  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    is_current  BOOLEAN NOT NULL DEFAULT TRUE,
+    status      TEXT NOT NULL DEFAULT 'cataloged',   -- cheapest→deepest understanding
+    summary     TEXT,                       -- first, cheapest extraction (one-liner)
+    CONSTRAINT valid_file_status CHECK (status IN ('cataloged', 'summarized', 'extracted')),
+    CONSTRAINT files_version_unique UNIQUE (source_id, relpath, sha256)
+);
+
+CREATE INDEX files_current_idx ON evoiot.files (source_id, relpath) WHERE is_current;
+CREATE INDEX files_tenant_idx ON evoiot.files (tenant_id, last_seen DESC);
+
 -- Readings (unified time-series data)
 CREATE TABLE evoiot.readings (
     id              UUID DEFAULT gen_random_uuid(),
@@ -125,6 +151,21 @@ CREATE POLICY data_sources_select_policy ON evoiot.data_sources
         OR current_setting('request.jwt.claims', true)::json->>'role' = 'admin'
     );
 
+-- RLS Policies: files
+ALTER TABLE evoiot.files ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY files_select_policy ON evoiot.files
+    FOR SELECT
+    USING (
+        tenant_id = current_setting('request.jwt.claims', true)::json->>'tenant_id'
+        OR tenant_id = '*'
+        OR current_setting('request.jwt.claims', true)::json->>'role' = 'admin'
+    );
+
+-- Anonymous read access for development (remove in production)
+CREATE POLICY files_anon_select ON evoiot.files
+    FOR SELECT TO postgrest_anon USING (true);
+
 -- =============================================================================
 -- Role Permissions
 -- =============================================================================
@@ -142,8 +183,9 @@ GRANT ALL ON SCHEMA platform TO bento_writer;
 GRANT ALL ON ALL TABLES IN SCHEMA platform TO bento_writer;
 GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA platform TO bento_writer;
 
--- workflow_rw: SELECT on readings + tbox (for validation)
+-- workflow_rw: SELECT on readings + tbox (for validation), maintains files catalog
 GRANT SELECT ON ALL TABLES IN SCHEMA evoiot TO workflow_rw;
+GRANT INSERT, UPDATE ON evoiot.files TO workflow_rw;
 GRANT USAGE ON ALL SEQUENCES IN SCHEMA evoiot TO workflow_rw;
 
 -- edge_insert: INSERT on readings only
@@ -651,6 +693,12 @@ CREATE TRIGGER emit_event_on_change
 
 CREATE TRIGGER emit_event_on_change
     AFTER INSERT OR UPDATE ON evoiot.data_sources
+    FOR EACH ROW EXECUTE FUNCTION evoiot.emit_event();
+
+-- files: INSERT only — a new row is a discovery (provenance-worthy);
+-- last_seen refreshes on every scan and would flood events
+CREATE TRIGGER emit_event_on_change
+    AFTER INSERT ON evoiot.files
     FOR EACH ROW EXECUTE FUNCTION evoiot.emit_event();
 
 -- =============================================================================
