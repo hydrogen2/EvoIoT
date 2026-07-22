@@ -1,3 +1,3 @@
-from .workflow import device_discovery_workflow
+from .workflow import bacnet_scan
 
-__all__ = ["device_discovery_workflow"]
+__all__ = ["bacnet_scan"]

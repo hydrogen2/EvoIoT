@@ -229,17 +229,15 @@ class BacnetPullSource(Source):
         return None
 
     def _trigger_discovery(self):
-        """Resolution-chain style: on a missing IP, fire device_discovery async
-        and let the next cycle read the result. (Fixed workflow key = one
-        bootstrap run per edge; purge the invocation to force re-discovery.)"""
-        key = base64.urlsafe_b64encode(
-            f"{self.tenant}:{self.edge_ref}".encode()).decode().rstrip("=")
+        """Resolution-chain style: on missing addressing, fire the BACnet
+        metadata scan async (keyed by tenant, re-runnable) and let the next
+        cycle read the discovered IPs from the graph."""
+        key = base64.urlsafe_b64encode(self.tenant.encode()).decode().rstrip("=")
         try:
-            httpx.post(f"{RESTATE_INGRESS}/device_discovery/{key}/run/send",
-                       json={"tenant": self.tenant, "edge_ref": self.edge_ref},
-                       timeout=10)
+            httpx.post(f"{RESTATE_INGRESS}/bacnet_scan/{key}/scan/send",
+                       json={"tenant": self.tenant}, timeout=10)
         except httpx.HTTPError as e:
-            print(f"[bacnet_pull] discovery trigger failed: {e}", flush=True)
+            print(f"[bacnet_pull] scan trigger failed: {e}", flush=True)
 
     def _poll_list(self, device_id: str):
         """Object RawTags the platform knows for this device = the poll list."""

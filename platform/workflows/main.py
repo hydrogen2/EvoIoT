@@ -6,12 +6,12 @@ from discovery import equipment_discovery_workflow
 from extraction import file_extraction_workflow
 from watcher import file_watcher
 from collectors import collector
-from netdisco import device_discovery_workflow
+from netdisco import bacnet_scan
 
 # Create the Restate app with all workflows
 app = restate.app(services=[classification_workflow, equipment_discovery_workflow,
                             file_extraction_workflow, file_watcher, collector,
-                            device_discovery_workflow])
+                            bacnet_scan])
 
 if __name__ == "__main__":
     import hypercorn.asyncio

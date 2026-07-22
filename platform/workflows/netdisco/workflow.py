@@ -1,35 +1,55 @@
-"""Device discovery — first-class network discovery, separate from collection.
+"""BACnet metadata source — a first-class metadata source, peer to the file
+(project-folder) source. Both produce the point inventory; they differ only in
+what they carry. The file source (BMS export) gives names, units, equipment
+context — curated, no addressing, no liveness. This source gives the exhaustive
+on-the-wire inventory + addressing + live confirmation — no friendly names.
+Fused on BACnet identity in the graph, each fills the other's gaps.
 
-Collection is a dumb, fast, deterministic loop; discovery is occasional and
-sometimes needs to reason. This workflow keeps them apart. It bootstraps from
-the one seed a human must provide (edge SSH access, from a config map),
-explores the edge over SSH, and writes what it learns (device → IP) into the
-graph as revisable, provenanced facts. Collectors then READ addressing from the
-graph and trigger this workflow when something is missing — never discover
-inline.
+Runs a full scan on the edge over SSH (bacsearch → per-device object
+enumeration, via bacnet-tools raw sockets so it coexists with the incumbent
+BACstac), then fuses each device+object into the graph via fuse_wire_rawtag:
+corroboration upgrades a file-derived RawTag's origin to 'wire' and adds
+addressing/live-name without clobbering its metadata; scan-only points (e.g.
+a device the export missed) are created fresh.
 
-Today the discovery step is deterministic (bacsearch + parse), which covers
-simple sites. The `_discover_devices` seam is where LLM escalation belongs for
-messy topology (routed BACnet, multiple interfaces): an agent orchestrating
-bacsearch / bacrouter_raw / ip-addr over the same SSH transport, reasoning
-about what it finds. Kept out of the collector's hot path by construction.
+Kept separate from the collector's hot loop by construction. `_scan` is the
+seam where LLM escalation belongs for complex topology (routed BACnet,
+multi-interface) — an agent orchestrating the same tools over SSH.
 """
 
-import re
-import time
+import json
 
 from restate import VirtualObject, ObjectContext
 
-from collectors.framework import _load_config_map
+from collectors.framework import _load_config_map, _connect
 from collectors.transport import SshTransport
-from shared.graph import execute_cypher
 from shared.traced import traced_run
 
-# A VirtualObject (keyed by edge), not a Workflow: discovery must be
-# RE-RUNNABLE (retries, topology changes) — a Workflow key is single-use, so a
-# failed attempt would poison it forever. Restate also serializes handler calls
-# per key, so concurrent triggers for the same edge don't stampede.
-device_discovery_workflow = VirtualObject("device_discovery")
+# BACnet object-type enum → dashed name (matches the file extraction's forms so
+# wire and file RawTags share an identity). Device (8) becomes the device tag;
+# unrecognized types are kept as type-<N> so nothing is lost.
+OBJ_TYPE_NAME = {
+    0: "analog-input", 1: "analog-output", 2: "analog-value",
+    3: "binary-input", 4: "binary-output", 5: "binary-value",
+    13: "multi-state-input", 14: "multi-state-output", 19: "multi-state-value",
+}
+DEVICE_TYPE = 8
+
+bacnet_scan = VirtualObject("bacnet_scan")
+
+
+def _load_bacnet_source(tenant: str):
+    """The tenant's registered BACnet metadata data source (source_type='bacnet')."""
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT config FROM evoiot.data_sources
+                           WHERE source_type = 'bacnet' AND config->>'tenant' = %s
+                             AND enabled LIMIT 1""", (tenant,))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    return (row[0] if row else None)
 
 
 def _transport(tenant: str, edge_ref: str) -> SshTransport:
@@ -38,63 +58,83 @@ def _transport(tenant: str, edge_ref: str) -> SshTransport:
     return SshTransport(target=f"{user}@{host}" if user else host)
 
 
-def _bacsearch(transport: SshTransport, tools_dir: str, window: int):
-    """Deterministic pass: one Who-Is, parse the device directory."""
+def _scan(transport: SshTransport, tools_dir: str, window: int, timeout: float):
+    """Deterministic full scan: bacsearch + per-device object enumeration.
+    Seam for LLM escalation on complex networks (not yet built)."""
     out = transport.exec(
-        f"cd {tools_dir} && python3 bacsearch_raw.py --window {window} 2>/dev/null",
-        timeout=window + 40)
+        f"cd {tools_dir} && python3 bacscan_raw.py --name --window {window} "
+        f"--timeout {timeout} --out /tmp/evoiot_scan.jsonl 2>/dev/null "
+        f"&& cat /tmp/evoiot_scan.jsonl",
+        timeout=600)
     devices = []
-    for m in re.finditer(r"device_instance=(\d+)\s+ip=([\d.]+)\s+port=(\d+)", out):
-        devices.append({"device_instance": m.group(1), "ip": m.group(2),
-                        "port": int(m.group(3))})
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if rec.get("_meta") or "device" not in rec:
+            continue
+        devices.append(rec)
     return devices
 
 
-def _discover_devices(transport: SshTransport, tools_dir: str, window: int):
-    """Return the device directory. Deterministic bacsearch first; this is the
-    seam where an LLM agent takes over for complex networks (not yet built —
-    escalation would orchestrate bacrouter_raw/ip-addr/bacsearch and reason)."""
-    devices = _bacsearch(transport, tools_dir, window)
-    # if not devices: devices = _discover_devices_llm(transport, ...)  # future
-    return devices
+def _fuse(tenant: str, namespace: str, devices: list) -> dict:
+    """Fuse the scan into the graph. Returns counts."""
+    conn = _connect()
+    stats = {"devices": 0, "objects": 0, "skipped": 0}
+    try:
+        with conn.cursor() as cur:
+            for d in devices:
+                dev = str(d["device"])
+                cur.execute("SELECT evoiot.fuse_wire_rawtag(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                            (tenant, namespace, dev, None, None, "device",
+                             None, d.get("ip"), str(d.get("port") or "")))
+                stats["devices"] += 1
+                for o in d.get("objects", []):
+                    otype_num = o.get("type")
+                    if otype_num == DEVICE_TYPE or "instance" not in o:
+                        stats["skipped"] += 1
+                        continue
+                    otype = OBJ_TYPE_NAME.get(otype_num, f"type-{otype_num}")
+                    cur.execute("SELECT evoiot.fuse_wire_rawtag(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                                (tenant, namespace, dev, otype, str(o["instance"]),
+                                 "object", o.get("name"), None, None))
+                    stats["objects"] += 1
+    finally:
+        conn.close()
+    return stats
 
 
-def _write_device_ips(tenant: str, devices: list) -> list:
-    """Persist device → IP as graph facts on existing device RawTags."""
-    now_ms = int(time.time() * 1000)
-    written = []
-    for d in devices:
-        inst, ip = d["device_instance"], d["ip"]
-        res = execute_cypher(f"""
-            MATCH (r:RawTag {{building_id: '{tenant}', device_id: '{inst}', tag_type: 'device'}})
-            SET r.device_ip = '{ip}', r.ip_discovered_at = {now_ms}
-            RETURN r.id
-        """)
-        if res:
-            written.append({"device_instance": inst, "ip": ip})
-    return written
+@bacnet_scan.handler()
+async def scan(ctx: ObjectContext, request: dict) -> dict:
+    """Full inventory scan keyed by tenant. Config from the tenant's registered
+    bacnet data source; edge access from the config-map seed it references."""
+    tenant = (request or {}).get("tenant") or ctx.key()
+    config = _load_bacnet_source(tenant)
+    if config is None:
+        return {"status": "no_source", "message": f"no bacnet data source for {tenant}"}
 
+    edge_ref = (config.get("transport") or {}).get("ref", "rp-edge")
+    namespace = config.get("rawtag_namespace", "bms-export")
+    b = config.get("bacnet", {})
+    tools_dir = b.get("tool_dir", "/home/envuser/bacnet-tools")
+    window = int(b.get("window", 8))
+    timeout = float(b.get("read_timeout", 4.0))
 
-@device_discovery_workflow.handler()
-async def run(ctx: ObjectContext, request: dict) -> dict:
-    request = request or {}
-    tenant = request["tenant"]
-    edge_ref = request.get("edge_ref", "rp-edge")
-    tools_dir = request.get("tools_dir", "/home/envuser/bacnet-tools")
-    window = int(request.get("window", 6))
-
-    # Transport is a cheap, deterministic local object — build it directly, not
-    # as a journaled step (it isn't serializable, and needn't be replayed).
     transport = _transport(tenant, edge_ref)
 
-    devices = await traced_run(ctx, "discover_devices",
-        lambda: _discover_devices(transport, tools_dir, window), data_id=tenant)
-
+    devices = await traced_run(ctx, "scan_network",
+        lambda: _scan(transport, tools_dir, window, timeout), data_id=tenant)
     if not devices:
-        return {"status": "completed", "message": "no devices discovered",
-                "devices": []}
+        return {"status": "completed", "message": "no devices", "devices": []}
 
-    written = await traced_run(ctx, "write_device_ips",
-        lambda: _write_device_ips(tenant, devices), data_id=tenant)
+    stats = await traced_run(ctx, "fuse_inventory",
+        lambda: _fuse(tenant, namespace, devices), data_id=tenant)
 
-    return {"status": "completed", "discovered": devices, "written": written}
+    return {"status": "completed",
+            "discovered_devices": [{"device": d["device"], "ip": d.get("ip"),
+                                    "objects": d.get("object_count")} for d in devices],
+            **stats}

@@ -678,6 +678,75 @@ GRANT EXECUTE ON FUNCTION evoiot.compute_rawtag_id TO bento_writer, workflow_rw,
 GRANT EXECUTE ON FUNCTION evoiot.get_rawtag_template TO bento_writer, workflow_rw, postgrest_anon;
 GRANT EXECUTE ON FUNCTION evoiot.upsert_rawtag TO bento_writer, workflow_rw;
 
+-- Fuse a live BACnet observation into a RawTag. Uses the shared physical-
+-- network namespace (NOT the evidence source) so a wire scan MERGEs with the
+-- same node a file export produced. Corroboration UPGRADES origin to 'wire'
+-- and adds wire_* facts (authoritative live name, addressing) WITHOUT touching
+-- raw_data — so file-derived metadata (units, equipment context) survives.
+-- Scan-only points (not in any export) are created fresh with origin='wire'.
+CREATE OR REPLACE FUNCTION evoiot.fuse_wire_rawtag(
+    p_tenant_id TEXT,
+    p_namespace TEXT,                       -- shared physical-network namespace
+    p_device_id TEXT,
+    p_object_type TEXT DEFAULT NULL,
+    p_object_instance TEXT DEFAULT NULL,
+    p_tag_type TEXT DEFAULT 'object',       -- 'device' | 'object'
+    p_wire_name TEXT DEFAULT NULL,          -- authoritative live object name
+    p_device_ip TEXT DEFAULT NULL,
+    p_device_port TEXT DEFAULT NULL
+) RETURNS TEXT AS $$
+DECLARE
+    v_rawtag_id TEXT;
+    v_name_safe TEXT;
+BEGIN
+    EXECUTE 'LOAD ''age''';
+    EXECUTE 'SET search_path TO ag_catalog, evoiot, public';
+
+    IF p_tag_type = 'device' THEN
+        v_rawtag_id := p_tenant_id || ':' || p_namespace || ':' || p_device_id;
+    ELSE
+        v_rawtag_id := p_tenant_id || ':' || p_namespace || ':' || p_device_id
+            || ':' || COALESCE(p_object_type, '') || ':' || COALESCE(p_object_instance, '');
+    END IF;
+
+    v_name_safe := translate(COALESCE(p_wire_name, ''), E'\\''\"', '');
+
+    EXECUTE format($sql$
+        SELECT * FROM ag_catalog.cypher('platform', $cypher$
+            MERGE (r:RawTag {id: %L})
+            SET r.building_id = %L,
+                r.device_id = %L,
+                r.object_type = %L,
+                r.object_instance = %L,
+                r.protocol = 'bacnet',
+                r.tag_type = %L,
+                r.origin = 'wire',
+                r.wire_name = CASE WHEN %L <> '' THEN %L ELSE COALESCE(r.wire_name, '') END,
+                r.device_ip = CASE WHEN %L <> '' THEN %L ELSE COALESCE(r.device_ip, '') END,
+                r.device_port = CASE WHEN %L <> '' THEN %L ELSE COALESCE(r.device_port, '') END,
+                r.wire_confirmed_at = %L
+        $cypher$) AS (r agtype)
+    $sql$,
+        v_rawtag_id, p_tenant_id, p_device_id,
+        COALESCE(p_object_type, ''), COALESCE(p_object_instance, ''), p_tag_type,
+        v_name_safe, v_name_safe,
+        COALESCE(p_device_ip, ''), COALESCE(p_device_ip, ''),
+        COALESCE(p_device_port, ''), COALESCE(p_device_port, ''),
+        extract(epoch from now())::bigint * 1000
+    );
+
+    INSERT INTO evoiot.events (component, operation, data_id, actor, payload)
+    VALUES ('graph', 'fuse_wire_rawtag', v_rawtag_id, current_user,
+        jsonb_build_object('tenant_id', p_tenant_id, 'device_id', p_device_id,
+            'object_type', p_object_type, 'object_instance', p_object_instance,
+            'wire_name', p_wire_name, 'device_ip', p_device_ip));
+
+    RETURN v_rawtag_id;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+GRANT EXECUTE ON FUNCTION evoiot.fuse_wire_rawtag TO bento_writer, workflow_rw;
+
 -- =============================================================================
 -- Unified Events Table (provenance / logging / audit)
 -- =============================================================================
