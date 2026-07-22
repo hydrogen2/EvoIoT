@@ -36,7 +36,10 @@ import paho.mqtt.client as mqtt
 EDGE_SSH = os.environ.get("RP_EDGE_SSH", "hdb-rp-gw")
 INFLUX_BIN = "/home/envuser/influxdb-1.6.5/bin/influx"
 INFLUX_DB = "ot_o17757913456311166"
-INFLUX_RP = "ot_RAW_Envision_Edge"     # raw = pre-scaling, ≈ true BACnet presentValue
+# EnOS splits points across retention policies by type; the pre-normalization
+# "raw" tiers are disjoint and together ≈ true BACnet presentValue for the
+# whole building: RAW = analog, DI = digital/binary.
+INFLUX_RPS = ["ot_RAW_Envision_Edge", "ot_DI_Envision_Edge"]
 INFLUX_USER = os.environ.get("RP_INFLUX_USER", "root")
 INFLUX_PASS = os.environ.get("RP_INFLUX_PASS", "REDACTED_SEE_ENV_FILE")
 LD_INFO = "/home/envuser/energy-os/edge-dpf/config/fe_config_data/ld_info.xml"
@@ -78,40 +81,68 @@ def _influx(query: str) -> str:
     return _ssh(remote)
 
 
-def build_mapping(name_filter: re.Pattern) -> dict:
+def _parse_point_csv(text: str) -> dict:
+    points = {}
+    for row in csv.DictReader(io.StringIO(text)):
+        objid = (row.get("objectid") or "").strip()
+        pname = (row.get("point-name") or "").strip()
+        if not objid or ":" not in objid or not pname:
+            continue  # skip virtual/control points with no BACnet address
+        otype, _, oinst = objid.partition(":")
+        points[pname] = [otype, oinst]
+    return points
+
+
+def build_mapping(name_filter) -> dict:
     """Parse ld_info.xml + each selected asset's point.csv into:
         { assetId: {device, equipment, points: {point_name: (otype, oinst)}} }
-    Cached locally so repeat runs don't re-pull the config.
+    name_filter None selects every asset. All point.csv files are fetched in
+    one SSH call. Cached locally so repeat runs don't re-pull the config.
     """
     os.makedirs(CACHE_DIR, exist_ok=True)
-    cache = os.path.join(CACHE_DIR, "mapping.json")
+    tag = "all" if name_filter is None else "filtered"
+    cache = os.path.join(CACHE_DIR, f"mapping_{tag}.json")
     if os.path.exists(cache):
         with open(cache) as f:
             return json.load(f)
 
     ld_xml = _ssh(f"cat {LD_INFO}")
-    mapping = {}
+    assets = []  # (asset_id, device, equipment, point_path)
     for m in re.finditer(r"<ld_info\b([^>]*)>", ld_xml):
         attrs = dict(re.findall(r'(\w+)="([^"]*)"', m.group(1)))
         laddr = attrs.get("logic_addr_str", "")
         asset_id = attrs.get("asset_id", "")
         point_path = attrs.get("point_path", "")
-        if not (asset_id and point_path and name_filter.search(laddr)):
+        if not (asset_id and point_path):
             continue
-        # logic_addr_str: "RVP_118_L1_CH_01_bms_20260606:7777:0"
-        parts = laddr.split(":")
-        device = parts[1] if len(parts) > 1 else ""
-        equipment = parts[0]
+        if name_filter is not None and not name_filter.search(laddr):
+            continue
+        parts = laddr.split(":")  # "RVP_118_L1_CH_01_bms_...:7777:0"
+        assets.append((asset_id, parts[1] if len(parts) > 1 else "", parts[0], point_path))
 
-        points = {}
-        for row in csv.DictReader(io.StringIO(_ssh(f"cat {point_path}"))):
-            objid = (row.get("objectid") or "").strip()
-            pname = (row.get("point-name") or "").strip()
-            if not objid or ":" not in objid or not pname:
-                continue  # skip virtual/control points with no BACnet address
-            otype, _, oinst = objid.partition(":")
-            points[pname] = [otype, oinst]
-        mapping[asset_id] = {"device": device, "equipment": equipment, "points": points}
+    # Fetch every referenced point.csv in a single SSH call, delimited.
+    paths = sorted({a[3] for a in assets})
+    script = "".join(f'echo "@@@{p}"; cat "{p}" 2>/dev/null; ' for p in paths)
+    blob = _ssh(script)
+    csv_by_path = {}
+    cur = None
+    buf = []
+    for line in blob.splitlines():
+        if line.startswith("@@@"):
+            if cur is not None:
+                csv_by_path[cur] = "\n".join(buf)
+            cur, buf = line[3:], []
+        else:
+            buf.append(line)
+    if cur is not None:
+        csv_by_path[cur] = "\n".join(buf)
+
+    mapping = {}
+    for asset_id, device, equipment, point_path in assets:
+        mapping[asset_id] = {
+            "device": device, "equipment": equipment,
+            "points": _parse_point_csv(csv_by_path.get(point_path, "")),
+        }
 
     with open(cache, "w") as f:
         json.dump(mapping, f, indent=2)
@@ -121,20 +152,26 @@ def build_mapping(name_filter: re.Pattern) -> dict:
 
 
 def pull_readings(mapping: dict, window: str):
-    """Query influx for each asset's series in the window; yield decoded readings."""
-    for asset_id, info in mapping.items():
-        q = (f'SELECT value FROM {INFLUX_RP}./^HDB_EnOS/ '
-             f"WHERE \\\"assetId\\\"='{asset_id}' AND time > now() - {window}")
-        out = _influx(q)
-        for row in csv.reader(io.StringIO(out)):
-            # csv columns: name,time,value  (header repeats per measurement)
-            if len(row) < 3 or row[0] == "name":
+    """One bulk influx query per raw retention policy; yield decoded readings.
+    Reports how many point-series had no BACnet map (coverage diagnostic)."""
+    unmapped = set()
+    for rp in INFLUX_RPS:
+        q = (f'SELECT value FROM {rp}./^HDB_EnOS/ '
+             f'WHERE time > now() - {window} GROUP BY \\"assetId\\"')
+        for row in csv.reader(io.StringIO(_influx(q))):
+            # csv columns: name,tags,time,value  (header repeats per group)
+            if len(row) < 4 or row[0] == "name":
                 continue
-            measurement, ts, val = row[0], row[1], row[2]
+            measurement, tags, ts, val = row[0], row[1], row[2], row[3]
+            asset_id = tags.split("assetId=", 1)[-1] if "assetId=" in tags else ""
+            info = mapping.get(asset_id)
+            if info is None:
+                continue  # asset not in selected scope
             point_name = measurement.split("@", 1)[-1]
             obj = info["points"].get(point_name)
             if obj is None:
-                continue  # point not in this asset's BACnet map (EnOS-derived)
+                unmapped.add(f"{asset_id}:{point_name}")
+                continue  # point not in this asset's BACnet map
             try:
                 value = float(val)
             except ValueError:
@@ -146,6 +183,9 @@ def pull_readings(mapping: dict, window: str):
                 "asset_id": asset_id, "point_name": point_name,
                 "equipment": info["equipment"],
             }
+    if unmapped:
+        print(f"[collector] {len(unmapped)} point-series had no BACnet map (skipped)",
+              flush=True)
 
 
 def publish(readings) -> int:
@@ -194,8 +234,14 @@ def main():
     ap.add_argument("--interval", type=int, default=60)
     ap.add_argument("--window", default="15m", help="influx lookback per cycle")
     ap.add_argument("--filter", default=None, help="asset name regex (default: 2 chillers)")
+    ap.add_argument("--all", action="store_true", help="collect the whole building (all assets)")
     args = ap.parse_args()
-    name_filter = re.compile(args.filter) if args.filter else DEFAULT_FILTER
+    if args.all:
+        name_filter = None
+    elif args.filter:
+        name_filter = re.compile(args.filter)
+    else:
+        name_filter = DEFAULT_FILTER
 
     if args.loop:
         while True:
