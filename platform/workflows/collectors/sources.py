@@ -15,12 +15,24 @@ Sources:
 
 import csv
 import io
+import json
 import os
 import re
 import shlex
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
+
+import psycopg2
 
 from .transport import Transport
+
+# BACnet object-type name → numeric enum (for ReadProperty requests)
+OBJ_TYPE_NUM = {
+    "analog-input": 0, "analog-output": 1, "analog-value": 2,
+    "binary-input": 3, "binary-output": 4, "binary-value": 5,
+    "multi-state-input": 13, "multi-state-output": 14, "multi-state-value": 19,
+}
+PRESENT_VALUE = 85
 
 
 def norm_ts(ts: str) -> str:
@@ -154,8 +166,118 @@ class InfluxEnosSource(Source):
         return readings, newest
 
 
+# ── Generic BACnet pull-mode agent ──────────────────────────────────
+
+class BacnetPullSource(Source):
+    """Live BACnet ReadProperty polling, executed transiently on the edge.
+
+    The edge holds a dormant read tool (bacnet-tools, raw sockets so it
+    coexists with any incumbent BACstac); this source invokes it per pull —
+    no resident daemon. The poll list is owned by the platform: it comes from
+    the RawTags the platform already knows exist for each configured device.
+    There is no history here — each pull is a snapshot at read time, so the
+    watermark is unused.
+    """
+
+    def __init__(self, transport: Transport, config: dict):
+        self.t = transport
+        b = config.get("bacnet", {})
+        self.tool = b.get("tool_dir", "/home/envuser/bacnet-tools")
+        self.targets = b["targets"]        # [{device_id, ip, port?, dnet?, dadr?}]
+        self.chunk = int(b.get("chunk", 30))
+        self.timeout = float(b.get("timeout", 5.0))
+        self.tenant = config["tenant"]
+
+    def _poll_list(self, device_id: str):
+        """Object RawTags the platform knows for this device = the poll list."""
+        conn = psycopg2.connect(host=os.environ.get("POSTGRES_HOST", "postgres"),
+                                port=os.environ.get("POSTGRES_PORT", "5432"),
+                                database=os.environ.get("POSTGRES_DB", "postgres"),
+                                user=os.environ.get("POSTGRES_USER", "postgres"),
+                                password=os.environ.get("POSTGRES_PASSWORD", "postgres"))
+        conn.autocommit = True
+        try:
+            with conn.cursor() as cur:
+                cur.execute("LOAD 'age'")
+                cur.execute("SET search_path = ag_catalog, evoiot, public")
+                cur.execute(f"""
+                    SELECT object_type, object_instance FROM (
+                        SELECT * FROM cypher('platform', $$
+                            MATCH (r:RawTag)
+                            WHERE r.building_id = '{self.tenant}'
+                              AND r.device_id = '{device_id}'
+                              AND r.tag_type = 'object'
+                            RETURN r.object_type, r.object_instance
+                        $$) AS (object_type agtype, object_instance agtype)
+                    ) s
+                """)
+                out = []
+                for otype, oinst in cur.fetchall():
+                    ot = str(otype).strip('"')
+                    oi = str(oinst).strip('"')
+                    if ot in OBJ_TYPE_NUM and oi.isdigit():
+                        out.append((ot, oi))
+                return out
+        finally:
+            conn.close()
+
+    def _read_target(self, target: dict, objects):
+        ip = target["ip"]
+        if target.get("port"):
+            ip = f"{ip}:{target['port']}"
+        extra = ""
+        if target.get("dnet") is not None:
+            extra += f" --dnet {int(target['dnet'])}"
+        if target.get("dadr"):
+            extra += f" --dadr {shlex.quote(str(target['dadr']))}"
+
+        readings = []
+        for i in range(0, len(objects), self.chunk):
+            batch = objects[i:i + self.chunk]
+            # label = index within batch; results come back in request order
+            points = " ".join(
+                f"{OBJ_TYPE_NUM[ot]}:{oi}:{PRESENT_VALUE}:p{j}"
+                for j, (ot, oi) in enumerate(batch))
+            cmd = (f"cd {shlex.quote(self.tool)} && python3 bacread_multi.py "
+                   f"{shlex.quote(ip)} {points} --timeout {self.timeout} --json{extra}")
+            out = self.t.exec(cmd, timeout=int(self.timeout * len(batch) + 30))
+            try:
+                parsed = json.loads(out)
+            except json.JSONDecodeError:
+                continue
+            now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            for (ot, oi), res in zip(batch, parsed):
+                val = res.get("value")
+                if val is None or isinstance(val, list):
+                    continue  # timeout/error/multi — skip
+                try:
+                    value = float(val)
+                except (TypeError, ValueError):
+                    continue
+                readings.append({
+                    "device_id": target["device_id"],
+                    "object_type": ot, "object_instance": oi,
+                    "value": value, "unit": "", "observed_at": now,
+                    "provenance": {"read_by": "bacnet_pull", "device_ip": target["ip"]},
+                })
+        return readings
+
+    def pull(self, watermark):
+        readings = []
+        for target in self.targets:
+            objects = target.get("objects")
+            if objects:  # explicit list in config
+                objects = [(o[0], str(o[1])) for o in objects]
+            else:         # else derive from the graph (platform owns poll list)
+                objects = self._poll_list(target["device_id"])
+            readings.extend(self._read_target(target, objects))
+        return readings, watermark  # snapshot source: watermark unchanged
+
+
 def build_source(config: dict, transport: Transport) -> Source:
     stype = config.get("source")
     if stype == "influx_enos":
         return InfluxEnosSource(transport, config)
+    if stype == "bacnet_pull":
+        return BacnetPullSource(transport, config)
     raise ValueError(f"unknown source type: {stype}")
