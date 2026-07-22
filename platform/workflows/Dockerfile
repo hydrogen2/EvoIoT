@@ -2,8 +2,10 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install curl for Restate registration
-RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+# curl for Restate registration; openssh-client for the SSH transport
+# (collectors reach BMS-LAN edges over SSH)
+RUN apt-get update && apt-get install -y --no-install-recommends curl openssh-client \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install dependencies
 COPY requirements.txt .

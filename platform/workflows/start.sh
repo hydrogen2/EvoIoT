@@ -4,6 +4,16 @@ set -e
 RESTATE_ADMIN_URL="${RESTATE_ADMIN_URL:-http://restate:9070}"
 SERVICE_URL="${SERVICE_URL:-http://workflows:9080}"
 
+# Collector SSH transport: bind-mounted key has host ownership/perms that ssh
+# rejects; copy it into place owned by this user with 600.
+if [ -f /etc/collector/id_ed25519 ]; then
+    mkdir -p /root/.ssh && chmod 700 /root/.ssh
+    cp /etc/collector/id_ed25519 /root/.ssh/id_ed25519 && chmod 600 /root/.ssh/id_ed25519
+    [ -f /etc/collector/ssh_config ] && cp /etc/collector/ssh_config /root/.ssh/config
+    touch /root/.ssh/known_hosts && chmod 644 /root/.ssh/known_hosts
+    echo "Collector SSH key installed"
+fi
+
 # Start hypercorn in background
 python -m hypercorn main:app --bind 0.0.0.0:9080 &
 PID=$!

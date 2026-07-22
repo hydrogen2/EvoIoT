@@ -55,7 +55,7 @@ CREATE TABLE evoiot.data_sources (
     classification  TEXT DEFAULT 'pending',     -- 'classified' | 'pending' | 'rejected'
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     updated_at      TIMESTAMPTZ DEFAULT NOW(),
-    CONSTRAINT valid_source_type CHECK (source_type IN ('mqtt', 'http_poll', 'webhook', 'file', 'bacnet', 'modbus')),
+    CONSTRAINT valid_source_type CHECK (source_type IN ('mqtt', 'http_poll', 'webhook', 'file', 'bacnet', 'modbus', 'collector')),
     CONSTRAINT valid_registered_by CHECK (registered_by IN ('platform', 'user', 'ai')),
     CONSTRAINT valid_classification CHECK (classification IN ('classified', 'pending', 'rejected'))
 );

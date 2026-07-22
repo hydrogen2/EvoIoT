@@ -150,6 +150,11 @@ services:
       LLM_API_BASE: ${LLM_API_BASE:-http://host.docker.internal:8787/v1}
       LLM_API_KEY: ${LLM_API_KEY}
       FILE_STORE: /data/file_store
+      # Collector SSH transport + source credentials (edges reachable via the
+      # host's tailscale route, which the container NATs through)
+      COLLECTOR_SSH_KEY: /root/.ssh/id_ed25519
+      RP_INFLUX_USER: ${RP_INFLUX_USER:-root}
+      RP_INFLUX_PASS: ${RP_INFLUX_PASS:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -157,6 +162,10 @@ services:
       - ../tests/projects:/projects:ro
       # content-addressed snapshots of cataloged file versions
       - file_store:/data/file_store
+      # SSH key for collector transports (copied to /root/.ssh by start.sh so
+      # ssh accepts its ownership/perms); ssh config carries host aliases
+      - /home/supper-user/.ssh/id_ed25519:/etc/collector/id_ed25519:ro
+      - /home/supper-user/.ssh/config:/etc/collector/ssh_config:ro
     depends_on:
       postgres:
         condition: service_healthy
