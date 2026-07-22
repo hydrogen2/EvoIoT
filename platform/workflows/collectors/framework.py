@@ -35,10 +35,15 @@ DEFAULT_INTERVAL_S = 60
 collector = VirtualObject("collector")
 
 
-def _load_config(source_id: str):
+def _connect():
     conn = psycopg2.connect(host=POSTGRES_HOST, port=POSTGRES_PORT, database=POSTGRES_DB,
                             user=POSTGRES_USER, password=POSTGRES_PASSWORD)
     conn.autocommit = True
+    return conn
+
+
+def _load_config(source_id: str):
+    conn = _connect()
     try:
         with conn.cursor() as cur:
             cur.execute("""SELECT config, enabled FROM evoiot.data_sources
@@ -47,6 +52,35 @@ def _load_config(source_id: str):
     finally:
         conn.close()
     return row  # (config, enabled) or None
+
+
+def _load_config_map(tenant: str, name: str) -> dict:
+    conn = _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT config FROM evoiot.config_maps
+                           WHERE name = %s AND tenant_id IN (%s, '*')
+                           ORDER BY tenant_id = %s DESC LIMIT 1""",
+                        (name, tenant, tenant))
+            row = cur.fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        raise ValueError(f"config map '{name}' not found for tenant {tenant}")
+    return row[0] or {}
+
+
+def _resolve_transport(config: dict) -> dict:
+    """Resolve a transport spec, expanding a {"ref": "<config-map>"} into the
+    concrete connection from the seed config map (declared once, not embedded)."""
+    spec = dict(config.get("transport") or {})
+    ref = spec.pop("ref", None)
+    if ref:
+        ssh = _load_config_map(config["tenant"], ref).get("ssh", {})
+        spec.setdefault("type", "ssh")
+        host, user = ssh["host"], ssh.get("user")
+        spec["target"] = f"{user}@{host}" if user else host
+    return spec
 
 
 def run_cycle(source_id: str, watermark):
@@ -60,7 +94,7 @@ def run_cycle(source_id: str, watermark):
     if not enabled:
         return 0, watermark, interval, "disabled"
 
-    transport = build_transport(config.get("transport"))
+    transport = build_transport(_resolve_transport(config))
     source = build_source(config, transport)
     readings, new_watermark = source.pull(watermark)
 

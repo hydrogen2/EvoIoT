@@ -13,6 +13,7 @@ Sources:
   (bacnet_pull comes next — generic pull-mode agent.)
 """
 
+import base64
 import csv
 import io
 import json
@@ -22,9 +23,12 @@ import shlex
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 
+import httpx
 import psycopg2
 
 from .transport import Transport
+
+RESTATE_INGRESS = os.environ.get("RESTATE_INGRESS_URL", "http://restate:8080")
 
 # BACnet object-type name → numeric enum (for ReadProperty requests)
 OBJ_TYPE_NUM = {
@@ -183,19 +187,63 @@ class BacnetPullSource(Source):
         self.t = transport
         b = config.get("bacnet", {})
         self.tool = b.get("tool_dir", "/home/envuser/bacnet-tools")
-        self.targets = b["targets"]        # [{device_id, ip, port?, dnet?, dadr?}]
+        # devices to poll: just instance ids — addressing is DISCOVERED, not
+        # configured. (An optional explicit ip/objects per entry still works.)
+        self.devices = b.get("devices", [])
         self.chunk = int(b.get("chunk", 30))
         self.timeout = float(b.get("timeout", 5.0))
         self.tenant = config["tenant"]
+        self.edge_ref = (config.get("transport") or {}).get("ref", "rp-edge")
 
-    def _poll_list(self, device_id: str):
-        """Object RawTags the platform knows for this device = the poll list."""
+    @staticmethod
+    def _graph_conn():
         conn = psycopg2.connect(host=os.environ.get("POSTGRES_HOST", "postgres"),
                                 port=os.environ.get("POSTGRES_PORT", "5432"),
                                 database=os.environ.get("POSTGRES_DB", "postgres"),
                                 user=os.environ.get("POSTGRES_USER", "postgres"),
                                 password=os.environ.get("POSTGRES_PASSWORD", "postgres"))
         conn.autocommit = True
+        return conn
+
+    def _device_ip(self, device_id: str):
+        """Device addressing is graph knowledge (written by device_discovery),
+        not config. Returns the discovered IP or None."""
+        conn = self._graph_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("LOAD 'age'")
+                cur.execute("SET search_path = ag_catalog, evoiot, public")
+                cur.execute(f"""
+                    SELECT ip FROM (SELECT * FROM cypher('platform', $$
+                        MATCH (r:RawTag {{building_id: '{self.tenant}',
+                                          device_id: '{device_id}', tag_type: 'device'}})
+                        RETURN r.device_ip
+                    $$) AS (ip agtype)) s
+                """)
+                row = cur.fetchone()
+        finally:
+            conn.close()
+        if row and row[0]:
+            v = str(row[0]).strip('"')
+            return v if v and v != "null" else None
+        return None
+
+    def _trigger_discovery(self):
+        """Resolution-chain style: on a missing IP, fire device_discovery async
+        and let the next cycle read the result. (Fixed workflow key = one
+        bootstrap run per edge; purge the invocation to force re-discovery.)"""
+        key = base64.urlsafe_b64encode(
+            f"{self.tenant}:{self.edge_ref}".encode()).decode().rstrip("=")
+        try:
+            httpx.post(f"{RESTATE_INGRESS}/device_discovery/{key}/run/send",
+                       json={"tenant": self.tenant, "edge_ref": self.edge_ref},
+                       timeout=10)
+        except httpx.HTTPError as e:
+            print(f"[bacnet_pull] discovery trigger failed: {e}", flush=True)
+
+    def _poll_list(self, device_id: str):
+        """Object RawTags the platform knows for this device = the poll list."""
+        conn = self._graph_conn()
         try:
             with conn.cursor() as cur:
                 cur.execute("LOAD 'age'")
@@ -263,14 +311,26 @@ class BacnetPullSource(Source):
         return readings
 
     def pull(self, watermark):
-        readings = []
-        for target in self.targets:
-            objects = target.get("objects")
-            if objects:  # explicit list in config
-                objects = [(o[0], str(o[1])) for o in objects]
-            else:         # else derive from the graph (platform owns poll list)
-                objects = self._poll_list(target["device_id"])
+        readings, missing = [], []
+        for dev in self.devices:
+            device_id = dev if isinstance(dev, str) else dev["device_id"]
+            # addressing: explicit ip (rare), else discovered from the graph
+            ip = (dev.get("ip") if isinstance(dev, dict) else None) or self._device_ip(device_id)
+            if not ip:
+                missing.append(device_id)
+                continue
+            target = {"device_id": device_id, "ip": ip}
+            if isinstance(dev, dict):
+                target.update({k: dev[k] for k in ("port", "dnet", "dadr") if k in dev})
+            objects = (dev.get("objects") if isinstance(dev, dict) else None)
+            objects = ([(o[0], str(o[1])) for o in objects] if objects
+                       else self._poll_list(device_id))
             readings.extend(self._read_target(target, objects))
+
+        if missing:  # no addressing yet → kick discovery, resolve next cycle
+            self._trigger_discovery()
+            print(f"[bacnet_pull] no IP for devices {missing}; triggered "
+                  f"device_discovery", flush=True)
         return readings, watermark  # snapshot source: watermark unchanged
 
 

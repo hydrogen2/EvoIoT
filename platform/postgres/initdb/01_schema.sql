@@ -60,6 +60,23 @@ CREATE TABLE evoiot.data_sources (
     CONSTRAINT valid_classification CHECK (classification IN ('classified', 'pending', 'rejected'))
 );
 
+-- Config maps (SEEDS — the irreducible bootstrap facts that cannot be
+-- discovered, e.g. how to reach an edge over SSH). Deliberately relational
+-- and OUTSIDE the AGE graph: the graph is AI/agent-owned and revisable; seeds
+-- are human-set and must not be tampered with by AI. Enforced by grants below
+-- (AI/service roles get SELECT only). Data sources reference a config map by
+-- name via {"ref": "<name>"} instead of embedding the fact.
+CREATE TABLE evoiot.config_maps (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id   TEXT NOT NULL,
+    name        TEXT NOT NULL,              -- e.g. 'rp-edge'
+    config      JSONB NOT NULL,             -- e.g. {"ssh": {"host": "...", "user": "..."}}
+    description TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT config_maps_name_unique UNIQUE (tenant_id, name)
+);
+
 -- Files catalog (source_type='file' data sources: watched folders, uploads...)
 -- The catalog records only what is invariant for ANY file: bytes at a path.
 -- Identity is (source_id, relpath, sha256) — an edited file is a NEW immutable
@@ -165,6 +182,23 @@ CREATE POLICY files_select_policy ON evoiot.files
 -- Anonymous read access for development (remove in production)
 CREATE POLICY files_anon_select ON evoiot.files
     FOR SELECT TO postgrest_anon USING (true);
+
+-- config_maps: SEEDS are read-only to every non-admin role. Only the DB
+-- superuser (human operator / migrations) writes them; AI/service roles and
+-- the API read but cannot INSERT/UPDATE/DELETE, so an agent can never tamper
+-- with the bootstrap facts.
+ALTER TABLE evoiot.config_maps ENABLE ROW LEVEL SECURITY;
+CREATE POLICY config_maps_select_policy ON evoiot.config_maps
+    FOR SELECT
+    USING (
+        tenant_id = current_setting('request.jwt.claims', true)::json->>'tenant_id'
+        OR tenant_id = '*'
+        OR current_setting('request.jwt.claims', true)::json->>'role' = 'admin'
+    );
+CREATE POLICY config_maps_anon_select ON evoiot.config_maps
+    FOR SELECT TO postgrest_anon USING (true);
+GRANT SELECT ON evoiot.config_maps TO bento_writer, workflow_rw, edge_insert, ai_reader, postgrest_role, postgrest_anon;
+-- explicitly NO write grants to service/AI roles
 
 -- =============================================================================
 -- Role Permissions
