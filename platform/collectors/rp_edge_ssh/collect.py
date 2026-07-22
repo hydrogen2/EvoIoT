@@ -41,7 +41,7 @@ INFLUX_DB = "ot_o17757913456311166"
 # whole building: RAW = analog, DI = digital/binary.
 INFLUX_RPS = ["ot_RAW_Envision_Edge", "ot_DI_Envision_Edge"]
 INFLUX_USER = os.environ.get("RP_INFLUX_USER", "root")
-INFLUX_PASS = os.environ.get("RP_INFLUX_PASS", "REDACTED_SEE_ENV_FILE")
+INFLUX_PASS = os.environ.get("RP_INFLUX_PASS", "")  # set via .env (gitignored)
 LD_INFO = "/home/envuser/energy-os/edge-dpf/config/fe_config_data/ld_info.xml"
 
 MQTT_HOST = os.environ.get("MQTT_HOST", "localhost")
@@ -55,6 +55,7 @@ RAWTAG_SOURCE = "bms-export"
 AGENT_ID = "rp-edge-ssh"
 
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache")
+WATERMARK = os.path.join(CACHE_DIR, "watermark.txt")
 
 # Which assets to collect: name substring (matches logic_addr_str). Default =
 # the two chillers on the chiller-plant gateway (device instance 7777).
@@ -151,13 +152,40 @@ def build_mapping(name_filter) -> dict:
     return mapping
 
 
-def pull_readings(mapping: dict, window: str):
+def _norm_ts(ts: str) -> str:
+    """RFC3339 → fixed 9-digit-fractional form. Same length/format for all
+    values, so lexicographic order == chronological order and influx accepts
+    it back verbatim as a time bound."""
+    core = ts.rstrip("Z")
+    if "." in core:
+        head, frac = core.split(".", 1)
+        frac = (frac + "0" * 9)[:9]
+    else:
+        head, frac = core, "0" * 9
+    return f"{head}.{frac}Z"
+
+
+def read_watermark():
+    if os.path.exists(WATERMARK):
+        with open(WATERMARK) as f:
+            return f.read().strip() or None
+    return None
+
+
+def write_watermark(ts: str):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(WATERMARK, "w") as f:
+        f.write(ts)
+
+
+def pull_readings(mapping: dict, time_pred: str):
     """One bulk influx query per raw retention policy; yield decoded readings.
+    time_pred is the WHERE time clause (e.g. "time > '<watermark>'").
     Reports how many point-series had no BACnet map (coverage diagnostic)."""
     unmapped = set()
     for rp in INFLUX_RPS:
         q = (f'SELECT value FROM {rp}./^HDB_EnOS/ '
-             f'WHERE time > now() - {window} GROUP BY \\"assetId\\"')
+             f'WHERE {time_pred} GROUP BY \\"assetId\\"')
         for row in csv.reader(io.StringIO(_influx(q))):
             # csv columns: name,tags,time,value  (header repeats per group)
             if len(row) < 4 or row[0] == "name":
@@ -219,11 +247,23 @@ def publish(readings) -> int:
     return n
 
 
-def cycle(name_filter: re.Pattern, window: str):
+def cycle(name_filter, bootstrap_window: str):
+    """One incremental cycle: pull readings newer than the watermark (or the
+    bootstrap window on first run), publish, and advance the watermark to the
+    newest reading seen."""
     mapping = build_mapping(name_filter)
-    readings = list(pull_readings(mapping, window))
+    wm = read_watermark()
+    time_pred = f"time > '{wm}'" if wm else f"time > now() - {bootstrap_window}"
+
+    readings = list(pull_readings(mapping, time_pred))
+    if not readings:
+        print("[collector] no new readings", flush=True)
+        return 0
+
     sent = publish(readings)
-    print(f"[collector] published {sent} readings to MQTT", flush=True)
+    newest = max(_norm_ts(r["time"]) for r in readings)
+    write_watermark(newest)
+    print(f"[collector] published {sent} readings (watermark → {newest})", flush=True)
     return sent
 
 
@@ -232,7 +272,8 @@ def main():
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--loop", action="store_true")
     ap.add_argument("--interval", type=int, default=60)
-    ap.add_argument("--window", default="15m", help="influx lookback per cycle")
+    ap.add_argument("--window", default="15m",
+                    help="bootstrap lookback on first run (before a watermark exists)")
     ap.add_argument("--filter", default=None, help="asset name regex (default: 2 chillers)")
     ap.add_argument("--all", action="store_true", help="collect the whole building (all assets)")
     args = ap.parse_args()
@@ -242,6 +283,9 @@ def main():
         name_filter = re.compile(args.filter)
     else:
         name_filter = DEFAULT_FILTER
+
+    if not INFLUX_PASS:
+        sys.exit("RP_INFLUX_PASS not set (put it in collectors/rp_edge_ssh/.env)")
 
     if args.loop:
         while True:
