@@ -13,16 +13,19 @@ input:
 
 pipeline:
   processors:
-    # Add metadata - rawtag_id computed by PostgreSQL trigger using externalized template
+    # Add metadata. rawtag_id: if the source already knows the point's
+    # identity (e.g. the SSH collector reverse-maps EnOS data back to raw
+    # BACnet) it states rawtag_id and the PG trigger passes it through;
+    # otherwise it's null and the trigger computes it from the template.
     - mapping: |
         root = this
         root.id = uuid_v4()
         root.source_type = "sensor"
         root.tenant_id = this.building_id.or("default")
+        root.rawtag_id = this.rawtag_id.or(null)
         root.confidence = 1.0
         root.created_at = now()
         root.raw_payload = this.string()
-        # rawtag_id computed by PostgreSQL trigger from data_sources.rawtag_id_template
 
 output:
   sql_insert:
@@ -33,6 +36,7 @@ output:
       - id
       - tenant_id
       - source_type
+      - rawtag_id
       - point_type
       - value
       - unit
@@ -44,6 +48,7 @@ output:
         this.id,
         this.tenant_id,
         this.source_type,
+        this.rawtag_id,
         this.point_type,
         this.value,
         this.unit,
