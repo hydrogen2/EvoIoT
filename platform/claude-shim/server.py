@@ -38,10 +38,21 @@ CLI_ENV = {
 }
 
 
-def call_claude(prompt: str) -> str:
+# Map an OpenAI-style "model" request to a claude CLI model alias. Unknown /
+# absent requests fall back to the shim default (MODEL), so existing callers
+# (workflows send "openai/claude-code") are unaffected.
+def resolve_model(requested: str) -> str:
+    r = (requested or "").lower()
+    for alias in ("opus", "sonnet", "haiku"):
+        if alias in r:
+            return alias
+    return MODEL
+
+
+def call_claude(prompt: str, model: str = None) -> str:
     """Run claude -p and return the result text. Raises on failure."""
     proc = subprocess.run(
-        [CLAUDE_BIN, "-p", "--model", MODEL, "--output-format", "json"],
+        [CLAUDE_BIN, "-p", "--model", model or MODEL, "--output-format", "json"],
         input=prompt,
         capture_output=True,
         text=True,
@@ -102,15 +113,16 @@ class Handler(BaseHTTPRequestHandler):
                 parts.append(content)
             prompt = "\n\n".join(p for p in parts if p)
 
+            model = resolve_model(req.get("model"))
             started = time.time()
-            text = call_claude(prompt)
+            text = call_claude(prompt, model)
             print("[shim] completed in %.1fs, %d chars" % (time.time() - started, len(text)), flush=True)
 
             self._send(200, {
                 "id": "chatcmpl-" + uuid.uuid4().hex[:24],
                 "object": "chat.completion",
                 "created": int(time.time()),
-                "model": "claude-code/" + MODEL,
+                "model": "claude-code/" + model,
                 "choices": [{
                     "index": 0,
                     "message": {"role": "assistant", "content": text},
