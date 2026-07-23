@@ -1,12 +1,14 @@
 # Discovery Stream - MQTT to AGE Graph
-# Subscribes to discovery topic and creates RawTag nodes in AGE graph
+# Subscribes to the discovery topic (push-mode metadata from a resident edge
+# agent) and upserts RawTag nodes. The pull-mode bacnet metadata source is the
+# primary path now; this handles agents that push their own inventory.
 
 input:
   mqtt:
     urls:
       - tcp://mosquitto:1883
     topics:
-      - "buildings/+/agents/+/discovery"
+      - "tenants/+/agents/+/discovery"
     client_id: "platform-discovery"
     qos: 1
     auto_replay_nacks: true
@@ -15,76 +17,55 @@ pipeline:
   processors:
     - log:
         level: INFO
-        message: "Received discovery: ${! this.devices.length() } devices from ${! this.building_id }/${! this.source_id }"
+        message: "Received discovery: ${! this.devices.length() } devices from ${! this.tenant_id }/${! this.agent_id }"
 
-    # Store context for flattening
+    # Store context for flattening. building = the physical-network namespace;
+    # falls back to tenant if a single-building agent doesn't send it.
     - mapping: |
-        meta building_id = this.building_id
-        meta source_id = this.source_id
-        meta discovered_at = this.discovered_at
+        meta tenant_id = this.tenant_id
+        meta building = this.building.or(this.tenant_id)
         root = this.devices
 
-    # Flatten devices array
     - unarchive:
         format: json_array
 
-    # For each device, create device RawTag and object RawTags
-    # IDs are computed by PostgreSQL using externalized template from data_sources
+    # Fan each device out into a device tag + one tag per object, flat fields.
     - mapping: |
         let device = this
-        let building = meta("building_id")
-        let source = meta("source_id")
-        let disc_at = meta("discovered_at")
+        let tenant = meta("tenant_id")
+        let building = meta("building")
 
         let device_tag = {
-          "building_id": $building,
-          "source_id": $source,
-          "tag_type": "device",
-          "protocol": "bacnet",
-          "device_id": $device.device_id.string(),
-          "object_type": null,
-          "object_instance": null,
-          "raw_data": $device.without("objects").string(),
-          "discovered_at": $disc_at,
-          "last_seen_by": $source
+          "tenant_id": $tenant, "building": $building,
+          "tag_type": "device", "device_id": $device.device_id.string(),
+          "object_type": null, "object_instance": null,
+          "object_name": $device.name.or($device.device_id.string()), "unit": null
         }
 
         let object_tags = this.objects.map_each(obj -> {
-          "building_id": $building,
-          "source_id": $source,
-          "tag_type": "object",
-          "protocol": "bacnet",
-          "device_id": $device.device_id.string(),
-          "object_type": obj.object_type,
-          "object_instance": obj.object_instance.string(),
-          "raw_data": obj.string(),
-          "discovered_at": $disc_at,
-          "last_seen_by": $source
+          "tenant_id": $tenant, "building": $building,
+          "tag_type": "object", "device_id": $device.device_id.string(),
+          "object_type": obj.object_type, "object_instance": obj.object_instance.string(),
+          "object_name": obj.object_name, "unit": obj.unit
         })
 
         root = [$device_tag].concat($object_tags)
 
-    # Flatten to individual tags
     - unarchive:
         format: json_array
 
-    # Insert each RawTag via unified upsert function (computes ID from template)
+    # upsert_rawtag(tenant, building, device, otype, oinst, tag_type,
+    #   origin, evidence, object_name, unit, value_sample, path, ip, port)
     - sql_raw:
         driver: postgres
         dsn: "postgres://bento_writer:bento_dev_password@postgres:5432/postgres?sslmode=disable"
-        query: "SELECT evoiot.upsert_rawtag($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
+        query: "SELECT evoiot.upsert_rawtag($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)"
         args_mapping: |
           root = [
-            this.building_id,
-            this.source_id,
-            this.device_id,
-            this.object_type,
-            this.object_instance,
-            this.protocol,
-            this.tag_type,
-            this.raw_data,
-            this.discovered_at,
-            this.last_seen_by
+            this.tenant_id, this.building, this.device_id,
+            this.object_type, this.object_instance, this.tag_type,
+            "wire", "mqtt:discovery",
+            this.object_name, this.unit, null, null, null, null
           ]
 
 output:

@@ -31,7 +31,7 @@ COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
 # Environment defaults
 ENV EDGE_DB_PATH=/data/edge.db
-ENV BUILDING_ID=bldg-001
+ENV TENANT_ID=default
 ENV AGENT_ID=agent-001
 ENV BACNET_NETWORK=192.168.100.1/24
 ENV POLL_INTERVAL=10

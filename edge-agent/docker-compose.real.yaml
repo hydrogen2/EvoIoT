@@ -17,7 +17,7 @@ services:
     # host networking, bridge mode would swallow Who-Is broadcasts.
     network_mode: host
     environment:
-      BUILDING_ID: "${BUILDING_ID:?set BUILDING_ID in .env}"
+      TENANT_ID: "${TENANT_ID:?set TENANT_ID in .env}"
       AGENT_ID: "${AGENT_ID:-agent-001}"
       # This device's own IP on the BACnet network (BAC0 binds to it)
       BACNET_IP: "${BACNET_IP:?set BACNET_IP in .env (this device's IP on the BMS LAN)}"

@@ -122,7 +122,7 @@ def _publish(config: dict, readings: list):
     tenant = config["tenant"]
     agent = config.get("agent_id", "collector")
     ns = resolve_namespace(config)   # building name, not the source
-    topic = f"buildings/{tenant}/agents/{agent}/telemetry"
+    topic = f"tenants/{tenant}/agents/{agent}/telemetry"
 
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"collector-{agent}")
     client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
@@ -131,7 +131,7 @@ def _publish(config: dict, readings: list):
         for r in readings:
             rawtag_id = f"{tenant}:{ns}:{r['device_id']}:{r['object_type']}:{r['object_instance']}"
             payload = {
-                "building_id": tenant, "source_id": agent,
+                "tenant_id": tenant, "agent_id": agent,
                 "rawtag_id": rawtag_id, "device_id": r["device_id"],
                 "object_type": r["object_type"], "object_instance": r["object_instance"],
                 "point_type": "unclassified", "value": r["value"],

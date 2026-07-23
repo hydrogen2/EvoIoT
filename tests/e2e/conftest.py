@@ -144,7 +144,7 @@ def _purge_test_tenants(session_started_at):
             cur.execute("SET search_path = ag_catalog, evoiot, public")
             cur.execute(f"""
                 SELECT * FROM cypher('platform', $$
-                    MATCH (r:RawTag) WHERE r.building_id STARTS WITH '{TEST_TENANT_PREFIX}'
+                    MATCH (r:RawTag) WHERE r.tenant_id STARTS WITH '{TEST_TENANT_PREFIX}'
                     DETACH DELETE r
                 $$) AS (x agtype)
             """)
@@ -263,12 +263,13 @@ def mqtt_client(stack):
 # ---------------------------------------------------------------------------
 # MQTT seed helpers (data flows through Bento → Postgres)
 # ---------------------------------------------------------------------------
-def publish_discovery(mqtt_client, tenant_id, source_id, devices):
+def publish_discovery(mqtt_client, tenant_id, source_id, devices, building=None):
     """Publish a discovery message to MQTT (triggers Bento discovery pipeline)."""
-    topic = f"buildings/{tenant_id}/agents/{source_id}/discovery"
+    topic = f"tenants/{tenant_id}/agents/{source_id}/discovery"
     payload = json.dumps({
-        "building_id": tenant_id,
-        "source_id": source_id,
+        "tenant_id": tenant_id,
+        "agent_id": source_id,
+        "building": building or tenant_id,
         "discovered_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "devices": devices,
     })
@@ -280,11 +281,11 @@ def publish_telemetry(mqtt_client, tenant_id, source_id, readings):
 
     Each reading dict should have: value, unit, point_type, object_type, object_instance, device_id
     """
-    topic = f"buildings/{tenant_id}/agents/{source_id}/telemetry"
+    topic = f"tenants/{tenant_id}/agents/{source_id}/telemetry"
     for reading in readings:
         payload = json.dumps({
-            "building_id": tenant_id,
-            "source_id": source_id,
+            "tenant_id": tenant_id,
+            "agent_id": source_id,
             "device_id": reading.get("device_id", "9001"),
             "object_type": reading.get("object_type", "analog-value"),
             "object_instance": reading.get("object_instance", "10"),

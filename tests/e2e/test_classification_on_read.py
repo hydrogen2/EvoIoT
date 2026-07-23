@@ -61,7 +61,7 @@ def seeded_data(db, mqtt_client):
             cur.execute(f"""
                 SELECT id FROM cypher('platform', $$
                     MATCH (r:RawTag)
-                    WHERE r.building_id = '{TENANT}'
+                    WHERE r.tenant_id = '{TENANT}'
                       AND r.object_type = 'analog-value' AND r.object_instance = '10'
                     RETURN r.id
                 $$) AS (id agtype)

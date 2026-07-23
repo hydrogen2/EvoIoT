@@ -48,7 +48,7 @@ services:
     build: .
     container_name: edge-agent
     environment:
-      BUILDING_ID: "bldg-001"
+      TENANT_ID: "default"
       SOURCE_ID: "bacnet-sim"
       AGENT_ID: "agent-001"
       BACNET_IP: "192.168.100.5"
