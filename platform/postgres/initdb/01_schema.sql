@@ -816,13 +816,6 @@ CREATE TRIGGER emit_event_on_change
     FOR EACH ROW EXECUTE FUNCTION evoiot.emit_event();
 
 -- =============================================================================
--- Seed Data Sources with RawTag ID Templates
--- =============================================================================
--- Global BACnet template - used as fallback for all tenants
-INSERT INTO evoiot.data_sources (tenant_id, name, source_type, rawtag_id_template, registered_by, classification)
-VALUES ('*', 'BACnet Default', 'bacnet', '{tenant_id}:{source_id}:{device_id}:{object_type}:{object_instance}', 'platform', 'classified');
-
--- =============================================================================
 -- PostgREST Schema Cache Reload
 -- =============================================================================
 -- Notify PostgREST to reload schema cache (useful when re-running this script)
