@@ -19,7 +19,6 @@ from shared.llm import summarize_file, propose_table_mapping
 from shared.traced import traced_run
 
 FILE_STORE = os.environ.get("FILE_STORE", "/data/file_store")
-SOURCE_LABEL = "bms-export"   # rawtag source segment for file-derived claims
 
 file_extraction_workflow = Workflow("file_extraction")
 
@@ -86,6 +85,10 @@ def _extract(file: dict, spec: dict) -> dict:
     result = tabular.apply_mapping(sheets, spec)
     claims = result["claims"]
     evidence_base = f"file:{file['sha256'][:12]}#{result['sheet']}"
+    # rawtag_id namespace = the BUILDING, derived from folder position
+    # (HDB/RP/... -> RP). Source is recorded per-tag as origin='file', not in
+    # the identity — so wire-scanned RawTags for the same points fuse here.
+    namespace = file["building"] or file["tenant_id"]
 
     conn = _connect()
     try:
@@ -96,7 +99,7 @@ def _extract(file: dict, spec: dict) -> dict:
             for device_id, device_name in devices.items():
                 cur.execute(
                     "SELECT evoiot.upsert_rawtag(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                    (file["tenant_id"], SOURCE_LABEL, device_id, None, None,
+                    (file["tenant_id"], namespace, device_id, None, None,
                      "bacnet", "device", json.dumps({"name": device_name}, ensure_ascii=False),
                      None, f"file:{file['sha256'][:12]}",
                      "file", evidence_base, file["building"]))
@@ -108,7 +111,7 @@ def _extract(file: dict, spec: dict) -> dict:
                 }.items() if v is not None}
                 cur.execute(
                     "SELECT evoiot.upsert_rawtag(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                    (file["tenant_id"], SOURCE_LABEL, c["device_id"],
+                    (file["tenant_id"], namespace, c["device_id"],
                      c["object_type"], c["object_instance"], "bacnet", "object",
                      json.dumps(raw_data, ensure_ascii=False), None, f"file:{file['sha256'][:12]}",
                      "file", f"{evidence_base}!r{c['row']}", file["building"]))

@@ -21,7 +21,7 @@ import json
 
 from restate import VirtualObject, ObjectContext
 
-from collectors.framework import _load_config_map, _connect
+from collectors.framework import _load_config_map, _connect, resolve_namespace
 from collectors.transport import SshTransport
 from shared.traced import traced_run
 
@@ -118,7 +118,7 @@ async def scan(ctx: ObjectContext, request: dict) -> dict:
         return {"status": "no_source", "message": f"no bacnet data source for {tenant}"}
 
     edge_ref = (config.get("transport") or {}).get("ref", "rp-edge")
-    namespace = config.get("rawtag_namespace", "bms-export")
+    namespace = resolve_namespace(config)   # building name (from the seed)
     b = config.get("bacnet", {})
     tools_dir = b.get("tool_dir", "/home/envuser/bacnet-tools")
     window = int(b.get("window", 8))

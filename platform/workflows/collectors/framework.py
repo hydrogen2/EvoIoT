@@ -83,6 +83,18 @@ def _resolve_transport(config: dict) -> dict:
     return spec
 
 
+def resolve_namespace(config: dict) -> str:
+    """The rawtag_id namespace is the BUILDING (physical-network scope), NOT the
+    evidence source — source is recorded per-tag as origin. Single-building edge
+    sources take it from their seed config map; it can also be set explicitly."""
+    ref = (config.get("transport") or {}).get("ref")
+    if ref:
+        building = _load_config_map(config["tenant"], ref).get("building")
+        if building:
+            return building
+    return config.get("building") or config["tenant"]
+
+
 def run_cycle(source_id: str, watermark):
     """One pull cycle for a collector. Returns (published, new_watermark,
     interval, status)."""
@@ -109,7 +121,7 @@ def _publish(config: dict, readings: list):
     RawTags regardless of which evidence source reported the point."""
     tenant = config["tenant"]
     agent = config.get("agent_id", "collector")
-    ns = config.get("rawtag_namespace", agent)
+    ns = resolve_namespace(config)   # building name, not the source
     topic = f"buildings/{tenant}/agents/{agent}/telemetry"
 
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"collector-{agent}")
