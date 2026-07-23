@@ -7,7 +7,7 @@ Fused on BACnet identity in the graph, each fills the other's gaps.
 
 Runs a full scan on the edge over SSH (bacsearch → per-device object
 enumeration, via bacnet-tools raw sockets so it coexists with the incumbent
-BACstac), then fuses each device+object into the graph via fuse_wire_rawtag:
+BACstac), then fuses each device+object into the graph via upsert_rawtag:
 corroboration upgrades a file-derived RawTag's origin to 'wire' and adds
 addressing/live-name without clobbering its metadata; scan-only points (e.g.
 a device the export missed) are created fresh.
@@ -87,11 +87,14 @@ def _fuse(tenant: str, namespace: str, devices: list) -> dict:
     stats = {"devices": 0, "objects": 0, "skipped": 0}
     try:
         with conn.cursor() as cur:
+            # upsert_rawtag(tenant, building, device, otype, oinst, tag_type,
+            #   origin, evidence, object_name, unit, value_sample, path, ip, port)
             for d in devices:
                 dev = str(d["device"])
-                cur.execute("SELECT evoiot.fuse_wire_rawtag(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                cur.execute("SELECT evoiot.upsert_rawtag(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                             (tenant, namespace, dev, None, None, "device",
-                             None, d.get("ip"), str(d.get("port") or "")))
+                             "wire", "bacnet:whois", None, None, None, None,
+                             d.get("ip"), str(d.get("port") or "")))
                 stats["devices"] += 1
                 for o in d.get("objects", []):
                     otype_num = o.get("type")
@@ -99,9 +102,10 @@ def _fuse(tenant: str, namespace: str, devices: list) -> dict:
                         stats["skipped"] += 1
                         continue
                     otype = OBJ_TYPE_NAME.get(otype_num, f"type-{otype_num}")
-                    cur.execute("SELECT evoiot.fuse_wire_rawtag(%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    cur.execute("SELECT evoiot.upsert_rawtag(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                                 (tenant, namespace, dev, otype, str(o["instance"]),
-                                 "object", o.get("name"), None, None))
+                                 "object", "wire", "bacnet:objectlist",
+                                 o.get("name"), None, None, None, None, None))
                     stats["objects"] += 1
     finally:
         conn.close()

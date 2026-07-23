@@ -557,195 +557,93 @@ CREATE TRIGGER compute_rawtag_id_on_insert
     FOR EACH ROW
     EXECUTE FUNCTION evoiot.compute_rawtag_id_trigger();
 
--- Unified function to create or update a RawTag node in the graph
--- Computes rawtag_id from externalized template in data_sources
--- Handles both telemetry and discovery use cases
+-- Upsert a RawTag node. ONE function for every evidence source — the source
+-- category is the p_origin PARAMETER (not a per-source function). Namespace is
+-- the building (physical-network scope); source lives in origin/evidence, never
+-- in identity. Attributes are flat and CASE-preserved: a source only overwrites
+-- a field when it provides a non-empty value, so file (names/units) and wire
+-- (live name/addressing) fuse on the same node without clobbering each other.
+-- origin 'wire' wins over 'file' (observed beats claimed).
 CREATE OR REPLACE FUNCTION evoiot.upsert_rawtag(
     p_tenant_id TEXT,
-    p_source_id TEXT,
+    p_building TEXT,                    -- namespace = building
     p_device_id TEXT,
     p_object_type TEXT DEFAULT NULL,
     p_object_instance TEXT DEFAULT NULL,
-    p_protocol TEXT DEFAULT 'bacnet',
-    p_tag_type TEXT DEFAULT 'object',      -- 'device' or 'object'
-    p_raw_data TEXT DEFAULT NULL,
-    p_discovered_at TEXT DEFAULT NULL,
-    p_last_seen_by TEXT DEFAULT NULL,
-    p_origin TEXT DEFAULT 'wire',           -- 'wire' (observed) | 'file' (claimed by evidence)
-    p_evidence TEXT DEFAULT NULL,           -- provenance fragment, e.g. file:sha#Sheet!r5
-    p_building TEXT DEFAULT NULL            -- building hint (a belief, e.g. from folder position)
-) RETURNS TEXT AS $$
-DECLARE
-    v_template TEXT;
-    v_payload JSONB;
-    v_rawtag_id TEXT;
-    v_raw_data_safe TEXT;
-BEGIN
-    -- Load AGE extension
-    EXECUTE 'LOAD ''age''';
-    EXECUTE 'SET search_path TO ag_catalog, evoiot, public';
-
-    -- Compute rawtag_id based on tag type
-    IF p_tag_type = 'device' THEN
-        v_rawtag_id := p_tenant_id || ':' || p_source_id || ':' || p_device_id;
-    ELSE
-        -- Object tags: use template from data_sources
-        v_template := evoiot.get_rawtag_template(p_tenant_id, p_protocol);
-        IF v_template IS NOT NULL THEN
-            v_payload := jsonb_build_object(
-                'tenant_id', p_tenant_id,
-                'source_id', p_source_id,
-                'device_id', p_device_id,
-                'object_type', COALESCE(p_object_type, ''),
-                'object_instance', COALESCE(p_object_instance, '')
-            );
-            v_rawtag_id := evoiot.compute_rawtag_id(v_template, v_payload);
-        ELSE
-            -- Fallback to default format
-            v_rawtag_id := p_tenant_id || ':' || p_source_id || ':' || p_device_id || ':' || COALESCE(p_object_type, '') || ':' || COALESCE(p_object_instance, '');
-        END IF;
-    END IF;
-
-    -- Sanitize raw_data for Cypher string literals.
-    -- format(%L) wraps in single quotes and escapes single quotes by doubling,
-    -- but Cypher's string parser inside $cypher$ blocks cannot handle doubled quotes
-    -- or backslash escapes. Strip all quotes and backslashes from raw_data.
-    v_raw_data_safe := translate(COALESCE(p_raw_data, ''), E'\\''\"', '');
-
-    -- MERGE creates if not exists, updates if exists (use EXECUTE for cypher)
-    -- Use CASE to preserve existing non-empty values for raw_data, discovered_at, last_seen_by
-    EXECUTE format($sql$
-        SELECT * FROM ag_catalog.cypher('platform', $cypher$
-            MERGE (r:RawTag {id: %L})
-            SET r.building_id = %L,
-                r.source_id = %L,
-                r.device_id = %L,
-                r.object_type = %L,
-                r.object_instance = %L,
-                r.protocol = %L,
-                r.tag_type = %L,
-                r.raw_data = CASE WHEN %L <> '' THEN %L ELSE COALESCE(r.raw_data, '') END,
-                r.discovered_at = CASE WHEN %L <> '' THEN %L ELSE COALESCE(r.discovered_at, '') END,
-                r.last_seen_by = CASE WHEN %L <> '' THEN %L ELSE COALESCE(r.last_seen_by, '') END,
-                r.origin = CASE WHEN r.origin = 'wire' OR %L = 'wire' THEN 'wire' ELSE %L END,
-                r.evidence = CASE WHEN %L <> '' THEN %L ELSE COALESCE(r.evidence, '') END,
-                r.building = CASE WHEN %L <> '' THEN %L ELSE COALESCE(r.building, '') END,
-                r.updated_at = %L
-        $cypher$) AS (r agtype)
-    $sql$,
-        v_rawtag_id,
-        p_tenant_id,
-        p_source_id,
-        p_device_id,
-        COALESCE(p_object_type, ''),
-        COALESCE(p_object_instance, ''),
-        p_protocol,
-        p_tag_type,
-        v_raw_data_safe, v_raw_data_safe,
-        COALESCE(p_discovered_at, ''), COALESCE(p_discovered_at, ''),
-        COALESCE(p_last_seen_by, ''), COALESCE(p_last_seen_by, ''),
-        COALESCE(p_origin, 'wire'), COALESCE(p_origin, 'wire'),
-        COALESCE(p_evidence, ''), COALESCE(p_evidence, ''),
-        COALESCE(p_building, ''), COALESCE(p_building, ''),
-        extract(epoch from now())::bigint * 1000
-    );
-
-    -- Emit provenance event for graph mutation
-    INSERT INTO evoiot.events (component, operation, data_id, actor, payload)
-    VALUES (
-        'graph',
-        'upsert_rawtag',
-        v_rawtag_id,
-        current_user,
-        jsonb_build_object(
-            'tenant_id', p_tenant_id,
-            'source_id', p_source_id,
-            'device_id', p_device_id,
-            'object_type', p_object_type,
-            'object_instance', p_object_instance,
-            'tag_type', p_tag_type,
-            'raw_data', p_raw_data,
-            'origin', COALESCE(p_origin, 'wire'),
-            'evidence', p_evidence
-        )
-    );
-
-    RETURN v_rawtag_id;
-END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
-
-GRANT EXECUTE ON FUNCTION evoiot.compute_rawtag_id TO bento_writer, workflow_rw, postgrest_anon;
-GRANT EXECUTE ON FUNCTION evoiot.get_rawtag_template TO bento_writer, workflow_rw, postgrest_anon;
-GRANT EXECUTE ON FUNCTION evoiot.upsert_rawtag TO bento_writer, workflow_rw;
-
--- Fuse a live BACnet observation into a RawTag. Uses the shared physical-
--- network namespace (NOT the evidence source) so a wire scan MERGEs with the
--- same node a file export produced. Corroboration UPGRADES origin to 'wire'
--- and adds wire_* facts (authoritative live name, addressing) WITHOUT touching
--- raw_data — so file-derived metadata (units, equipment context) survives.
--- Scan-only points (not in any export) are created fresh with origin='wire'.
-CREATE OR REPLACE FUNCTION evoiot.fuse_wire_rawtag(
-    p_tenant_id TEXT,
-    p_namespace TEXT,                       -- shared physical-network namespace
-    p_device_id TEXT,
-    p_object_type TEXT DEFAULT NULL,
-    p_object_instance TEXT DEFAULT NULL,
-    p_tag_type TEXT DEFAULT 'object',       -- 'device' | 'object'
-    p_wire_name TEXT DEFAULT NULL,          -- authoritative live object name
+    p_tag_type TEXT DEFAULT 'object',   -- 'device' | 'object'
+    p_origin TEXT DEFAULT 'wire',       -- source category: 'file' | 'wire' | ...
+    p_evidence TEXT DEFAULT NULL,       -- provenance fragment
+    p_object_name TEXT DEFAULT NULL,
+    p_unit TEXT DEFAULT NULL,
+    p_value_sample TEXT DEFAULT NULL,
+    p_path TEXT DEFAULT NULL,
     p_device_ip TEXT DEFAULT NULL,
     p_device_port TEXT DEFAULT NULL
 ) RETURNS TEXT AS $$
 DECLARE
-    v_rawtag_id TEXT;
-    v_name_safe TEXT;
+    v_id TEXT;
+    v_name TEXT; v_unit TEXT; v_vs TEXT; v_path TEXT; v_ev TEXT;
 BEGIN
     EXECUTE 'LOAD ''age''';
     EXECUTE 'SET search_path TO ag_catalog, evoiot, public';
 
     IF p_tag_type = 'device' THEN
-        v_rawtag_id := p_tenant_id || ':' || p_namespace || ':' || p_device_id;
+        v_id := p_tenant_id || ':' || p_building || ':' || p_device_id;
     ELSE
-        v_rawtag_id := p_tenant_id || ':' || p_namespace || ':' || p_device_id
+        v_id := p_tenant_id || ':' || p_building || ':' || p_device_id
             || ':' || COALESCE(p_object_type, '') || ':' || COALESCE(p_object_instance, '');
     END IF;
 
-    v_name_safe := translate(COALESCE(p_wire_name, ''), E'\\''\"', '');
+    -- strip quotes/backslashes: cypher's parser inside $cypher$ can't handle them
+    v_name := translate(COALESCE(p_object_name, ''), E'\\''"', '');
+    v_unit := translate(COALESCE(p_unit, ''), E'\\''"', '');
+    v_vs   := translate(COALESCE(p_value_sample, ''), E'\\''"', '');
+    v_path := translate(COALESCE(p_path, ''), E'\\''"', '');
+    v_ev   := translate(COALESCE(p_evidence, ''), E'\\''"', '');
 
     EXECUTE format($sql$
         SELECT * FROM ag_catalog.cypher('platform', $cypher$
             MERGE (r:RawTag {id: %L})
-            SET r.building_id = %L,
+            SET r.tenant_id = %L,
+                r.building = %L,
                 r.device_id = %L,
                 r.object_type = %L,
                 r.object_instance = %L,
                 r.protocol = 'bacnet',
                 r.tag_type = %L,
-                r.origin = 'wire',
-                r.wire_name = CASE WHEN %L <> '' THEN %L ELSE COALESCE(r.wire_name, '') END,
+                r.origin = CASE WHEN r.origin = 'wire' OR %L = 'wire' THEN 'wire' ELSE %L END,
+                r.object_name = CASE WHEN %L <> '' THEN %L ELSE COALESCE(r.object_name, '') END,
+                r.unit = CASE WHEN %L <> '' THEN %L ELSE COALESCE(r.unit, '') END,
+                r.value_sample = CASE WHEN %L <> '' THEN %L ELSE COALESCE(r.value_sample, '') END,
+                r.path = CASE WHEN %L <> '' THEN %L ELSE COALESCE(r.path, '') END,
                 r.device_ip = CASE WHEN %L <> '' THEN %L ELSE COALESCE(r.device_ip, '') END,
                 r.device_port = CASE WHEN %L <> '' THEN %L ELSE COALESCE(r.device_port, '') END,
-                r.wire_confirmed_at = %L
+                r.evidence = CASE WHEN %L <> '' THEN %L ELSE COALESCE(r.evidence, '') END,
+                r.updated_at = %L
         $cypher$) AS (r agtype)
     $sql$,
-        v_rawtag_id, p_tenant_id, p_device_id,
+        v_id, p_tenant_id, p_building, p_device_id,
         COALESCE(p_object_type, ''), COALESCE(p_object_instance, ''), p_tag_type,
-        v_name_safe, v_name_safe,
+        COALESCE(p_origin, 'wire'), COALESCE(p_origin, 'wire'),
+        v_name, v_name, v_unit, v_unit, v_vs, v_vs, v_path, v_path,
         COALESCE(p_device_ip, ''), COALESCE(p_device_ip, ''),
         COALESCE(p_device_port, ''), COALESCE(p_device_port, ''),
+        v_ev, v_ev,
         extract(epoch from now())::bigint * 1000
     );
 
     INSERT INTO evoiot.events (component, operation, data_id, actor, payload)
-    VALUES ('graph', 'fuse_wire_rawtag', v_rawtag_id, current_user,
-        jsonb_build_object('tenant_id', p_tenant_id, 'device_id', p_device_id,
-            'object_type', p_object_type, 'object_instance', p_object_instance,
-            'wire_name', p_wire_name, 'device_ip', p_device_ip));
+    VALUES ('graph', 'upsert_rawtag', v_id, current_user,
+        jsonb_build_object('tenant_id', p_tenant_id, 'building', p_building,
+            'device_id', p_device_id, 'object_type', p_object_type,
+            'object_instance', p_object_instance, 'origin', p_origin,
+            'object_name', p_object_name, 'device_ip', p_device_ip));
 
-    RETURN v_rawtag_id;
+    RETURN v_id;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
-GRANT EXECUTE ON FUNCTION evoiot.fuse_wire_rawtag TO bento_writer, workflow_rw;
+GRANT EXECUTE ON FUNCTION evoiot.upsert_rawtag TO bento_writer, workflow_rw;
 
 -- =============================================================================
 -- Unified Events Table (provenance / logging / audit)

@@ -215,7 +215,7 @@ class BacnetPullSource(Source):
                 cur.execute("SET search_path = ag_catalog, evoiot, public")
                 cur.execute(f"""
                     SELECT ip FROM (SELECT * FROM cypher('platform', $$
-                        MATCH (r:RawTag {{building_id: '{self.tenant}',
+                        MATCH (r:RawTag {{tenant_id: '{self.tenant}',
                                           device_id: '{device_id}', tag_type: 'device'}})
                         RETURN r.device_ip
                     $$) AS (ip agtype)) s
@@ -250,7 +250,7 @@ class BacnetPullSource(Source):
                     SELECT object_type, object_instance FROM (
                         SELECT * FROM cypher('platform', $$
                             MATCH (r:RawTag)
-                            WHERE r.building_id = '{self.tenant}'
+                            WHERE r.tenant_id = '{self.tenant}'
                               AND r.device_id = '{device_id}'
                               AND r.tag_type = 'object'
                             RETURN r.object_type, r.object_instance

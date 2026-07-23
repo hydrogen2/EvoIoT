@@ -93,28 +93,23 @@ def _extract(file: dict, spec: dict) -> dict:
     conn = _connect()
     try:
         with conn.cursor() as cur:
+            # upsert_rawtag(tenant, building, device, otype, oinst, tag_type,
+            #   origin, evidence, object_name, unit, value_sample, path, ip, port)
             devices = {}
             for c in claims:
                 devices[c["device_id"]] = c["device_name"]
             for device_id, device_name in devices.items():
                 cur.execute(
-                    "SELECT evoiot.upsert_rawtag(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                    (file["tenant_id"], namespace, device_id, None, None,
-                     "bacnet", "device", json.dumps({"name": device_name}, ensure_ascii=False),
-                     None, f"file:{file['sha256'][:12]}",
-                     "file", evidence_base, file["building"]))
+                    "SELECT evoiot.upsert_rawtag(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (file["tenant_id"], namespace, device_id, None, None, "device",
+                     "file", evidence_base, device_name, None, None, None, None, None))
             for c in claims:
-                raw_data = {k: v for k, v in {
-                    "object_name": c["object_name"], "unit": c["unit"],
-                    "value_sample": c["value_sample"], "writable": c["writable"],
-                    "path": c["path"],
-                }.items() if v is not None}
                 cur.execute(
-                    "SELECT evoiot.upsert_rawtag(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    "SELECT evoiot.upsert_rawtag(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (file["tenant_id"], namespace, c["device_id"],
-                     c["object_type"], c["object_instance"], "bacnet", "object",
-                     json.dumps(raw_data, ensure_ascii=False), None, f"file:{file['sha256'][:12]}",
-                     "file", f"{evidence_base}!r{c['row']}", file["building"]))
+                     c["object_type"], c["object_instance"], "object",
+                     "file", f"{evidence_base}!r{c['row']}",
+                     c["object_name"], c["unit"], c["value_sample"], c["path"], None, None))
             cur.execute("UPDATE evoiot.files SET status = 'extracted' WHERE sha256 = %s",
                         (file["sha256"],))
     finally:

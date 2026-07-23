@@ -11,7 +11,7 @@ from shared.traced import traced_run, _emit_event
 class DiscoverRequest(BaseModel):
     """Request to discover equipment from raw tags."""
     tenant_id: str
-    source_id: str | None = None
+    building: str | None = None       # optional scope within the tenant
 
 
 equipment_discovery_workflow = Workflow("equipment_discovery")
@@ -32,7 +32,7 @@ async def run(ctx: WorkflowContext, request: DiscoverRequest) -> dict:
     # Step 1: Fetch RawTags
     rawtags = await traced_run(ctx,
         "fetch_rawtags",
-        lambda: graph.get_rawtags_for_context(request.tenant_id, request.source_id)
+        lambda: graph.get_rawtags_for_context(request.tenant_id, request.building)
     )
 
     if not rawtags:

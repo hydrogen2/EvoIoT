@@ -124,18 +124,18 @@ def execute_cypher(query: str) -> list[dict]:
         _emit_graph_event(op, _extract_cypher_id(query), query)
 
 
-def get_rawtags_for_context(building_id: str, source_id: str | None = None) -> list[dict]:
-    """Get all RawTags for a building, optionally filtered by source."""
-    if source_id:
+def get_rawtags_for_context(tenant_id: str, building: str | None = None) -> list[dict]:
+    """Get all RawTags for a tenant, optionally scoped to one building."""
+    if building:
         query = f"""
             MATCH (t:RawTag)
-            WHERE t.building_id = '{building_id}' AND t.source_id = '{source_id}'
+            WHERE t.tenant_id = '{tenant_id}' AND t.building = '{building}'
             RETURN t
         """
     else:
         query = f"""
             MATCH (t:RawTag)
-            WHERE t.building_id = '{building_id}'
+            WHERE t.tenant_id = '{tenant_id}'
             RETURN t
         """
     results = execute_cypher(query)
