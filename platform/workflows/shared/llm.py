@@ -28,7 +28,7 @@ DISCOVER_EQUIPMENT_USER_TEMPLATE = """## Available Device Types:
 
 ## Raw Tags to group:
 {rawtags}
-
+{feedback_section}
 Group all raw tags by equipment. Return a JSON array of equipment objects:
 [
   {{
@@ -160,9 +160,14 @@ def _call_llm(system_prompt: str, user_content: str, max_tokens: int = 16384) ->
 def discover_equipment_from_rawtags(
     rawtags: list[dict],
     device_types: list[dict],
+    feedback: str | None = None,
 ) -> list[dict]:
     """
     Group raw tags by equipment using LLM.
+
+    Args:
+        feedback: human guidance from a rejected previous round, so the LLM
+                  re-groups rather than repeating the same mistake.
 
     Returns:
         List of {equipment_name, equipment_type, rawtag_ids}
@@ -187,9 +192,15 @@ def discover_equipment_from_rawtags(
         })
     rawtags_str = json.dumps(condensed, default=str)
 
+    feedback_section = ""
+    if feedback:
+        feedback_section = (f"\n## Human Feedback (from the previous attempt):\n{feedback}\n"
+                            "\nRe-group accordingly — correct what the feedback says is wrong.\n")
+
     user_content = DISCOVER_EQUIPMENT_USER_TEMPLATE.format(
         device_types=device_types_str,
         rawtags=rawtags_str,
+        feedback_section=feedback_section,
     )
 
     print(f"[llm] discover_equipment: sending {len(rawtags)} rawtags, {len(device_types)} device types", flush=True)

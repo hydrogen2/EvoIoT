@@ -16,6 +16,10 @@ class DiscoverRequest(BaseModel):
 
 equipment_discovery_workflow = Workflow("equipment_discovery")
 
+# Rework rounds: a rejection with feedback re-runs the grouping with that
+# guidance. Bounded so a stubborn disagreement terminates rather than spins.
+MAX_ROUNDS = 3
+
 
 @equipment_discovery_workflow.main()
 async def run(ctx: WorkflowContext, request: DiscoverRequest) -> dict:
@@ -44,63 +48,78 @@ async def run(ctx: WorkflowContext, request: DiscoverRequest) -> dict:
         lambda: graph.get_device_types()
     )
 
-    # Step 3: Call LLM to group by equipment
-    equipment_list = await traced_run(ctx,
-        "discover_equipment",
-        lambda: discover_equipment_from_rawtags(rawtags, device_types)
-    )
+    # Steps 3-6: propose -> review -> (rework with feedback) -> ratify.
+    # Bounded so a stubborn disagreement ends rather than looping forever.
+    feedback = None
+    approved, rejected, history = [], [], []
 
-    if not equipment_list:
-        return {"status": "completed", "message": "No equipment discovered", "equipment": []}
+    for round_no in range(1, MAX_ROUNDS + 1):
+        equipment_list = await traced_run(ctx,
+            f"discover_equipment_r{round_no}",
+            lambda fb=feedback: discover_equipment_from_rawtags(rawtags, device_types, feedback=fb)
+        )
+        if not equipment_list:
+            break
 
-    # Step 4: Create Equipment nodes as PROPOSALS (status='proposed').
-    # Nothing is authoritative until a human ratifies it — an unreviewed LLM
-    # grouping reads as fact once it's in the graph (e.g. typing the plant
-    # 'CHPL' as a Chiller), and everything downstream inherits the mistake.
-    proposed = await traced_run(ctx,
-        "create_proposals",
-        lambda: _create_proposals(equipment_list, request.tenant_id)
-    )
+        # Already-ratified equipment must not be downgraded back to 'proposed'
+        settled = {e["equipment_name"] for e in approved}
+        proposed = await traced_run(ctx,
+            f"create_proposals_r{round_no}",
+            lambda el=equipment_list, sk=settled: _create_proposals(el, request.tenant_id, skip=sk)
+        )
+        if not proposed:
+            break
 
-    # Step 5: Wait for human review (durably suspends until /review is called)
-    decisions = await ctx.promise("review").value()
+        # Expose the round so the review handler resolves the right promise
+        ctx.set("round", round_no)
+        decisions = await ctx.promise(f"review_{round_no}").value()
 
-    _emit_event(
-        component="restate.discovery",
-        operation="human_review",
-        data_id=ctx.key(),
-        trace_id=ctx.key(),
-        actor="human",
-        payload={"decisions": decisions},
-    )
+        _emit_event(component="restate.discovery", operation="human_review",
+                    data_id=ctx.key(), trace_id=ctx.key(), actor="human",
+                    payload={"round": round_no, "decisions": decisions})
 
-    # Step 6: Apply decisions — approve keeps it, reject removes it entirely
-    approved, rejected = [], []
-    by_name = {p["equipment_name"]: p for p in proposed}
-    for d in decisions or []:
-        name = d.get("equipment_name")
-        if name not in by_name:
-            continue
-        if d.get("approved"):
-            await traced_run(ctx, f"approve_{name}",
-                lambda n=name: graph.update_equipment_status(request.tenant_id, n, "approved"),
-                data_id=f"{request.tenant_id}:{name}")
-            approved.append(by_name[name])
-        else:
-            await traced_run(ctx, f"reject_{name}",
-                lambda n=name: graph.delete_equipment(request.tenant_id, n),
-                data_id=f"{request.tenant_id}:{name}")
-            rejected.append(by_name[name])
+        by_name = {p["equipment_name"]: p for p in proposed}
+        notes = []
+        for d in decisions or []:
+            name = d.get("equipment_name")
+            if name not in by_name:
+                continue
+            if d.get("approved"):
+                await traced_run(ctx, f"approve_{name}_r{round_no}",
+                    lambda n=name: graph.update_equipment_status(request.tenant_id, n, "approved"),
+                    data_id=f"{request.tenant_id}:{name}")
+                approved.append(by_name[name])
+            else:
+                await traced_run(ctx, f"reject_{name}_r{round_no}",
+                    lambda n=name: graph.delete_equipment(request.tenant_id, n),
+                    data_id=f"{request.tenant_id}:{name}")
+                rejected.append(by_name[name])
+                if d.get("feedback"):
+                    notes.append(f"- '{name}' (proposed as {by_name[name]['equipment_type']}) "
+                                 f"was rejected: {d['feedback']}")
 
-    # Anything the reviewer didn't mention stays 'proposed' — not authoritative.
-    undecided = [p for n, p in by_name.items()
-                 if n not in {d.get("equipment_name") for d in (decisions or [])}]
+        history.append({"round": round_no, "proposed": len(proposed),
+                        "approved": len(approved), "rejected": len(rejected),
+                        "feedback_items": len(notes)})
+
+        # No actionable guidance -> nothing to rework, we're done
+        if not notes:
+            break
+        if round_no == MAX_ROUNDS:
+            break
+        feedback = "\n".join(notes)
+
+    # Anything never ratified stays 'proposed' — never authoritative
+    still_proposed = await traced_run(ctx, "pending_after_review",
+        lambda: graph.get_pending_equipment(), data_id=ctx.key())
 
     return {
         "status": "completed",
         "approved": approved,
         "rejected": rejected,
-        "still_proposed": undecided,
+        "still_proposed": [p for p in still_proposed
+                           if p.get("tenant_id") == request.tenant_id],
+        "rounds": history,
     }
 
 
@@ -113,24 +132,33 @@ async def get_proposals(ctx: WorkflowSharedContext) -> dict:
 
 @equipment_discovery_workflow.handler()
 async def review(ctx: WorkflowSharedContext, decisions: list[dict]) -> dict:
-    """Submit review decisions.
+    """Submit review decisions for the current round.
 
     Args:
         decisions: List of {equipment_name, approved: bool, feedback?: str}
+
+    A rejection carrying `feedback` triggers a rework round: the grouping is
+    re-run with that guidance instead of the correction being discarded.
     """
-    await ctx.promise("review").resolve(decisions)
-    return {"status": "review submitted", "decisions": decisions}
+    round_no = await ctx.get("round") or 1
+    await ctx.promise(f"review_{round_no}").resolve(decisions)
+    return {"status": "review submitted", "round": round_no, "decisions": decisions}
 
 
-def _create_proposals(equipment_list: list[dict], tenant_id: str) -> list[dict]:
-    """Create proposed Equipment nodes and BELONGS_TO edges."""
+def _create_proposals(equipment_list: list[dict], tenant_id: str,
+                      skip: set = None) -> list[dict]:
+    """Create proposed Equipment nodes and BELONGS_TO edges.
+
+    `skip` holds names already ratified in this run — re-proposing them would
+    downgrade an approved node back to 'proposed'."""
     proposals = []
+    skip = skip or set()
     for equip in equipment_list:
         name = equip.get("equipment_name")
         etype = equip.get("equipment_type")
         rawtag_ids = equip.get("rawtag_ids", [])
 
-        if not name or not etype:
+        if not name or not etype or name in skip:
             continue
 
         for rawtag_id in rawtag_ids:

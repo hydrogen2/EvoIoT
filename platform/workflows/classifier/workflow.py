@@ -18,6 +18,9 @@ class ClassifyRequest(BaseModel):
 # Create the workflow
 classification_workflow = Workflow("classifier")
 
+# Bounded feedback-driven rework (see equipment_discovery for the same pattern)
+MAX_ROUNDS = 3
+
 
 @classification_workflow.main()
 async def run(ctx: WorkflowContext, request: ClassifyRequest) -> dict:
@@ -52,75 +55,82 @@ async def run(ctx: WorkflowContext, request: ClassifyRequest) -> dict:
         lambda: _get_equipment_type(request.tenant_id, request.equipment)
     )
 
-    # Step 3: Classify with LLM (scoped to this equipment's tags)
-    classifications = await traced_run(ctx,
-        "classify",
-        lambda: classify_rawtags(
-            rawtags, request.tbox_types, property_defs,
-            equipment_name=request.equipment,
-            equipment_type=equip_info.get("device_type", ""),
+    # Steps 3-6: propose -> review -> (rework with feedback) -> ratify.
+    # Rework re-classifies ONLY the rejected types (points are independent),
+    # bounded so a stubborn disagreement terminates.
+    pending_types = list(request.tbox_types)
+    feedback = None
+    approved, rejected, history = [], [], []
+
+    for round_no in range(1, MAX_ROUNDS + 1):
+        classifications = await traced_run(ctx,
+            f"classify_r{round_no}",
+            lambda t=pending_types, fb=feedback: classify_rawtags(
+                rawtags, t, property_defs,
+                equipment_name=request.equipment,
+                equipment_type=equip_info.get("device_type", ""),
+                feedback=fb,
+            )
         )
-    )
 
-    # Step 4: Create proposals in graph
-    proposals = await traced_run(ctx,
-        "create_proposals",
-        lambda: _create_proposals(classifications)
-    )
+        proposals = await traced_run(ctx,
+            f"create_proposals_r{round_no}",
+            lambda c=classifications: _create_proposals(c)
+        )
+        if not proposals:
+            break
 
-    if not proposals:
-        return {
-            "status": "completed",
-            "message": "No classifications proposed by LLM",
-            "proposals": []
-        }
+        ctx.set("round", round_no)
+        review_decisions = await ctx.promise(f"review_{round_no}").value()
 
-    # Step 5: Wait for human review
-    review_decisions = await ctx.promise("review").value()
+        _emit_event(
+            component="restate.classifier",
+            operation="human_review",
+            data_id=ctx.key(),
+            trace_id=ctx.key(),
+            actor="human",
+            payload={"round": round_no, "decisions": review_decisions},
+        )
 
-    _emit_event(
-        component="restate.classifier",
-        operation="human_review",
-        data_id=ctx.key(),
-        trace_id=ctx.key(),
-        actor="human",
-        payload={"decisions": review_decisions},
-    )
-
-    # Step 6: Process decisions
-    approved = []
-    rejected = []
-
-    for decision in review_decisions:
-        matching = [p for p in proposals
-                   if p["rawtag_id"] == decision.get("rawtag_id")
-                   and p["tbox_type"] == decision.get("tbox_type")]
-        if matching:
+        notes, redo = [], []
+        for decision in review_decisions or []:
+            matching = [p for p in proposals
+                        if p["rawtag_id"] == decision.get("rawtag_id")
+                        and p["tbox_type"] == decision.get("tbox_type")]
+            if not matching:
+                continue
             proposal = matching[0]
             if decision.get("approved"):
-                await traced_run(ctx,
-                    f"approve_{proposal['tbox_type']}",
+                await traced_run(ctx, f"approve_{proposal['tbox_type']}_r{round_no}",
                     lambda p=proposal: graph.update_is_type_of_status(
-                        p["rawtag_id"], p["tbox_type"], "approved", "workflow"
-                    ),
-                    data_id=proposal["rawtag_id"],
-                )
+                        p["rawtag_id"], p["tbox_type"], "approved", "workflow"),
+                    data_id=proposal["rawtag_id"])
                 approved.append(proposal)
             else:
-                await traced_run(ctx,
-                    f"reject_{proposal['tbox_type']}",
-                    lambda p=proposal, d=decision: graph.update_is_type_of_status(
-                        p["rawtag_id"], p["tbox_type"], "rejected",
-                        feedback=d.get("feedback")
-                    ),
-                    data_id=proposal["rawtag_id"],
-                )
+                fb = decision.get("feedback")
+                await traced_run(ctx, f"reject_{proposal['tbox_type']}_r{round_no}",
+                    lambda p=proposal, f=fb: graph.update_is_type_of_status(
+                        p["rawtag_id"], p["tbox_type"], "rejected", feedback=f),
+                    data_id=proposal["rawtag_id"])
                 rejected.append(proposal)
+                if fb:
+                    notes.append(f"- '{proposal['tbox_type']}' matched to "
+                                 f"{proposal['rawtag_id']} was rejected: {fb}")
+                    redo.append(proposal["tbox_type"])
+
+        history.append({"round": round_no, "proposed": len(proposals),
+                        "approved": len(approved), "rejected": len(rejected)})
+
+        if not notes or round_no == MAX_ROUNDS:
+            break
+        pending_types = sorted(set(redo))
+        feedback = "\n".join(notes)
 
     return {
         "status": "completed",
         "approved": approved,
-        "rejected": rejected
+        "rejected": rejected,
+        "rounds": history,
     }
 
 
@@ -138,8 +148,9 @@ async def review(ctx: WorkflowSharedContext, decisions: list[dict]) -> dict:
     Args:
         decisions: List of {rawtag_id, tbox_type, approved, feedback?}
     """
-    await ctx.promise("review").resolve(decisions)
-    return {"status": "review submitted", "decisions": decisions}
+    round_no = await ctx.get("round") or 1
+    await ctx.promise(f"review_{round_no}").resolve(decisions)
+    return {"status": "review submitted", "round": round_no, "decisions": decisions}
 
 
 # Helper functions
