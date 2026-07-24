@@ -101,15 +101,30 @@ async def run(ctx: WorkflowContext, request: DiscoverRequest) -> dict:
         if not equipment_list:
             break
 
-        # Self-check pass — audit the merged grouping and drop non-equipment
-        # (headers, infix artifacts, gateway ids, duplicates) that slipped past
-        # the per-device grouping. This is the "check its work" step.
+        # Self-check pass — a tool-grounded audit: each candidate is scored
+        # against its real point signature (point_profile) and its type's peer
+        # profile (tbox_profile), not by name. Drops non-equipment (all-sensor
+        # headers/fragments, duplicates) and reclassifies signature mismatches
+        # (e.g. a "Chiller" with a Valve signature). Applied to the in-memory
+        # list BEFORE proposals, so it's plain list surgery — no graph churn.
+        rawtag_by_id = {t["id"]: t for t in rawtags if t.get("id")}
         audit = await traced_run(ctx, f"self_check_r{round_no}",
-            lambda el=equipment_list: review_equipment_grouping(el))
+            lambda el=equipment_list: review_equipment_grouping(
+                el, rawtag_by_id, device_types))
         drop = set(audit.get("drop") or [])
-        if drop:
-            equipment_list = [e for e in equipment_list
-                              if e.get("equipment_name") not in drop]
+        retype = {r["name"]: r["to_type"] for r in (audit.get("reclassify") or [])
+                  if r.get("name") and r.get("to_type")}
+        valid_types = {d.get("name") for d in device_types}
+        if drop or retype:
+            cleaned = []
+            for e in equipment_list:
+                nm = e.get("equipment_name")
+                if nm in drop:
+                    continue
+                if nm in retype and retype[nm] in valid_types:
+                    e = {**e, "equipment_type": retype[nm]}
+                cleaned.append(e)
+            equipment_list = cleaned
 
         # Already-ratified equipment must not be downgraded back to 'proposed'
         settled = {e["equipment_name"] for e in approved}

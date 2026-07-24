@@ -112,34 +112,114 @@ def propose_table_mapping(filename: str, sample: str) -> dict:
     return json.loads(content)
 
 
-REVIEW_GROUPING_SYSTEM_PROMPT = """You are auditing an equipment grouping produced from BACnet tags — the "check your work" pass. You get the FULL list of proposed equipment (name, type, tag count) across the whole building.
+REVIEW_GROUPING_SYSTEM_PROMPT = """You are auditing an equipment grouping produced from BACnet tags — the "check your work" pass. You do NOT judge by name alone: each candidate comes with its STRUCTURAL SIGNATURE (its actual point profile), and each device type comes with its PEER PROFILE (the signature its other members share). Judge each candidate against that evidence.
 
-Find entries that are NOT a real physical equipment unit and should be dropped:
-- Plant / header / system aggregates (e.g. "CHPL", "*_Plant", "*_header", "system_*").
-- Name-infix artifacts (e.g. "*_hli", "CH_HLI") — not a device.
-- Gateway / network ids (bare numbers like "7777", "ModbusNetwork_*", "Rivervale_*_7777").
-- Vendor/driver point-groups with no real equipment name (e.g. "SC-equip-App", "SYSTEM_1").
-- Duplicates: if two entries are the same physical unit under name variants (e.g. "CHWP_1" and "CHWPUMP_1"), drop the longer/less-canonical one.
+How to read a signature:
+- A real physical device is controlled and/or monitored, so it carries a DEVICE SIGNATURE: command points (binary-output / analog-output) and/or status points (binary-input), alongside its sensors. Its point count sits near its type's peers.
+- A PLANT HEADER / AGGREGATE / vendor point-group is usually all sensors (analog-input only), no command, no status — a totals/rollup, not a device.
+- An INFIX or sub-function wrongly split off from its parent (e.g. "CH_1_hli") is a thin, all-sensor fragment whose parent (CH_1) holds the real command/status.
 
-Return JSON only: {"drop": ["name", ...], "reasons": {"name": "why", ...}}
-Only list names to drop. If everything looks like legitimate equipment, return {"drop": [], "reasons": {}}."""
+Decisions, each grounded in the signature vs the peer profile:
+1. DROP a candidate that is not real equipment: all-sensor with no command/status AND far below its type's peer point count (a header/aggregate/fragment), or a duplicate name-variant of another candidate (keep the shorter canonical name).
+2. RECLASSIFY a candidate whose signature clearly matches a DIFFERENT type's peer profile than the one it was assigned (e.g. assigned "Chiller" but has a Valve-like signature: ~3-4 points, one command, no sensors, matching the Valve peers). Only when the mismatch is unambiguous.
+
+Be conservative — the grouping is usually right. Prefer KEEP. Only act when the signature contradicts the assignment. When a value is empty, return empty.
+
+Return JSON only:
+{"drop": ["name", ...], "reclassify": [{"name": "name", "to_type": "Type"}, ...], "reasons": {"name": "why", ...}}"""
 
 
-def review_equipment_grouping(candidates: list[dict]) -> dict:
-    """Self-check pass over the merged grouping: returns names to drop.
-    Input is small (names+types+counts), so it's fast and cheap."""
+def _point_profile(rawtags: list[dict]) -> dict:
+    """The `point_profile` tool: a candidate's structural signature from its
+    actual points — object-type breakdown plus device-signature flags."""
+    from collections import Counter
+    by_type = Counter((t.get("object_type") or "?") for t in rawtags)
+    names = [(t.get("object_name") or "").lower() for t in rawtags]
+    has = lambda *ots: any(by_type.get(o, 0) for o in ots)
+    return {
+        "total": len(rawtags),
+        "by_type": dict(by_type),
+        "sensor": has("analog-input"),
+        "command": has("binary-output", "analog-output"),
+        "status": has("binary-input"),
+        "setpoint": any(any(s in n for s in ("setpoint", "_sp_", "stpt", "_spt", "setpt"))
+                        for n in names),
+    }
+
+
+def _type_peer_stats(profiled: list[dict]) -> dict:
+    """The `tbox_profile` tool (empirical): each type's peer profile derived
+    from the proposed set — point-count spread and how many members carry a
+    command / status signature. Lets the auditor spot outliers per building
+    without hard-coded expectations."""
+    from statistics import median
+    by_type: dict[str, list[dict]] = {}
+    for p in profiled:
+        by_type.setdefault(p["type"], []).append(p["profile"])
+    stats = {}
+    for t, profs in by_type.items():
+        totals = sorted(pr["total"] for pr in profs)
+        stats[t] = {
+            "count": len(profs),
+            "points_min": totals[0],
+            "points_median": int(median(totals)),
+            "points_max": totals[-1],
+            "with_command": sum(1 for pr in profs if pr["command"]),
+            "with_status": sum(1 for pr in profs if pr["status"]),
+        }
+    return stats
+
+
+def _fmt_profile(p: dict) -> str:
+    bd = " ".join(f"{k}:{v}" for k, v in sorted(p["by_type"].items()))
+    flags = "".join(f"{f}{'✓' if p[f] else '✗'} " for f in
+                    ("sensor", "status", "command", "setpoint"))
+    return f"{p['total']} pts [{bd}] {flags}".strip()
+
+
+def review_equipment_grouping(candidates: list[dict],
+                              rawtag_by_id: dict = None,
+                              device_types: list[dict] = None) -> dict:
+    """Tool-grounded self-check: audits each candidate against its real point
+    signature and its type's peer profile, returning drop + reclassify edits.
+
+    Without rawtag_by_id it degrades to a name/count audit (drop only)."""
     if not candidates:
-        return {"drop": [], "reasons": {}}
-    listing = "\n".join(
-        f"- {c.get('equipment_name')} (type={c.get('equipment_type')}, "
-        f"{len(c.get('rawtag_ids', []))} tags)" for c in candidates)
-    content = _call_llm(REVIEW_GROUPING_SYSTEM_PROMPT,
-                        f"## Proposed equipment:\n{listing}\n\nAudit and return the drop list.")
+        return {"drop": [], "reclassify": [], "reasons": {}}
+
+    rawtag_by_id = rawtag_by_id or {}
+    profiled = []
+    for c in candidates:
+        rts = [rawtag_by_id[i] for i in c.get("rawtag_ids", []) if i in rawtag_by_id]
+        prof = _point_profile(rts) if rts else {
+            "total": len(c.get("rawtag_ids", [])), "by_type": {},
+            "sensor": False, "command": False, "status": False, "setpoint": False}
+        profiled.append({"name": c.get("equipment_name"),
+                         "type": c.get("equipment_type"), "profile": prof})
+
+    peer = _type_peer_stats(profiled)
+    peer_block = "\n".join(
+        f"  {t}: {s['count']} units, points {s['points_min']}-{s['points_max']} "
+        f"(median {s['points_median']}), {s['with_command']}/{s['count']} have command, "
+        f"{s['with_status']}/{s['count']} have status"
+        for t, s in sorted(peer.items()))
+    cand_block = "\n".join(
+        f"- {p['name']} ({p['type']}): {_fmt_profile(p['profile'])}"
+        for p in profiled)
+    types = ", ".join(sorted(d.get("name", "") for d in (device_types or []))) or "(unknown)"
+
+    user = (f"## Known device types:\n{types}\n\n"
+            f"## Type peer profiles (from the proposed set):\n{peer_block}\n\n"
+            f"## Candidates with signatures:\n{cand_block}\n\n"
+            f"Audit against the signatures and peer profiles. Return the JSON.")
+    content = _call_llm(REVIEW_GROUPING_SYSTEM_PROMPT, user)
     try:
         result = json.loads(content)
-        return {"drop": result.get("drop", []), "reasons": result.get("reasons", {})}
+        return {"drop": result.get("drop", []) or [],
+                "reclassify": result.get("reclassify", []) or [],
+                "reasons": result.get("reasons", {}) or {}}
     except json.JSONDecodeError:
-        return {"drop": [], "reasons": {}}
+        return {"drop": [], "reclassify": [], "reasons": {}}
 
 
 # ── Point Classification ────────────────────────────────────────────
