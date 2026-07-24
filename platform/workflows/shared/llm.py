@@ -112,6 +112,36 @@ def propose_table_mapping(filename: str, sample: str) -> dict:
     return json.loads(content)
 
 
+REVIEW_GROUPING_SYSTEM_PROMPT = """You are auditing an equipment grouping produced from BACnet tags — the "check your work" pass. You get the FULL list of proposed equipment (name, type, tag count) across the whole building.
+
+Find entries that are NOT a real physical equipment unit and should be dropped:
+- Plant / header / system aggregates (e.g. "CHPL", "*_Plant", "*_header", "system_*").
+- Name-infix artifacts (e.g. "*_hli", "CH_HLI") — not a device.
+- Gateway / network ids (bare numbers like "7777", "ModbusNetwork_*", "Rivervale_*_7777").
+- Vendor/driver point-groups with no real equipment name (e.g. "SC-equip-App", "SYSTEM_1").
+- Duplicates: if two entries are the same physical unit under name variants (e.g. "CHWP_1" and "CHWPUMP_1"), drop the longer/less-canonical one.
+
+Return JSON only: {"drop": ["name", ...], "reasons": {"name": "why", ...}}
+Only list names to drop. If everything looks like legitimate equipment, return {"drop": [], "reasons": {}}."""
+
+
+def review_equipment_grouping(candidates: list[dict]) -> dict:
+    """Self-check pass over the merged grouping: returns names to drop.
+    Input is small (names+types+counts), so it's fast and cheap."""
+    if not candidates:
+        return {"drop": [], "reasons": {}}
+    listing = "\n".join(
+        f"- {c.get('equipment_name')} (type={c.get('equipment_type')}, "
+        f"{len(c.get('rawtag_ids', []))} tags)" for c in candidates)
+    content = _call_llm(REVIEW_GROUPING_SYSTEM_PROMPT,
+                        f"## Proposed equipment:\n{listing}\n\nAudit and return the drop list.")
+    try:
+        result = json.loads(content)
+        return {"drop": result.get("drop", []), "reasons": result.get("reasons", {})}
+    except json.JSONDecodeError:
+        return {"drop": [], "reasons": {}}
+
+
 # ── Point Classification ────────────────────────────────────────────
 
 CLASSIFY_SYSTEM_PROMPT = """You are an expert at classifying building automation system (BAS) data points.

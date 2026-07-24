@@ -4,8 +4,41 @@ from restate import Workflow, WorkflowContext, WorkflowSharedContext
 from pydantic import BaseModel
 
 from shared import graph
-from shared.llm import discover_equipment_from_rawtags
+from shared.llm import discover_equipment_from_rawtags, review_equipment_grouping
 from shared.traced import traced_run, _emit_event
+
+
+CHUNK_MAX_TAGS = 300   # keep each LLM call under the timeout / output ceiling
+
+
+def _chunk_device_tags(tags: list[dict]) -> list[list[dict]]:
+    """Split one device's tags into batches under CHUNK_MAX_TAGS. Sort by
+    object_name first so a single equipment's points stay adjacent and a size
+    cut rarely lands mid-equipment (e.g. an FCU device with ~71 units)."""
+    if len(tags) <= CHUNK_MAX_TAGS:
+        return [tags]
+    ordered = sorted(tags, key=lambda t: (t.get("object_name") or "", t.get("id") or ""))
+    return [ordered[i:i + CHUNK_MAX_TAGS]
+            for i in range(0, len(ordered), CHUNK_MAX_TAGS)]
+
+
+def _group_chunked(rawtags: list[dict], device_types: list[dict],
+                   feedback: str = None) -> list[dict]:
+    """Group tags in focused batches, not all at once. A monolithic 1059-tag
+    call on a careful model exceeds the LLM timeout AND drifts (the smaller,
+    focused scope is what makes the LLM get the chiller plant right). Split
+    per BACnet device — equipment don't span devices, so that's lossless — then
+    cap oversized devices into name-sorted batches. Results are merged."""
+    by_device = {}
+    for t in rawtags:
+        by_device.setdefault(t.get("device_id", ""), []).append(t)
+
+    merged = []
+    for device_id, tags in by_device.items():
+        for batch in _chunk_device_tags(tags):
+            groups = discover_equipment_from_rawtags(batch, device_types, feedback=feedback)
+            merged.extend(groups or [])
+    return merged
 
 
 class DiscoverRequest(BaseModel):
@@ -63,10 +96,20 @@ async def run(ctx: WorkflowContext, request: DiscoverRequest) -> dict:
 
         equipment_list = await traced_run(ctx,
             f"discover_equipment_r{round_no}",
-            lambda sc=scope, fb=feedback: discover_equipment_from_rawtags(sc, device_types, feedback=fb)
+            lambda sc=scope, fb=feedback: _group_chunked(sc, device_types, feedback=fb)
         )
         if not equipment_list:
             break
+
+        # Self-check pass — audit the merged grouping and drop non-equipment
+        # (headers, infix artifacts, gateway ids, duplicates) that slipped past
+        # the per-device grouping. This is the "check its work" step.
+        audit = await traced_run(ctx, f"self_check_r{round_no}",
+            lambda el=equipment_list: review_equipment_grouping(el))
+        drop = set(audit.get("drop") or [])
+        if drop:
+            equipment_list = [e for e in equipment_list
+                              if e.get("equipment_name") not in drop]
 
         # Already-ratified equipment must not be downgraded back to 'proposed'
         settled = {e["equipment_name"] for e in approved}
