@@ -53,10 +53,17 @@ async def run(ctx: WorkflowContext, request: DiscoverRequest) -> dict:
     feedback = None
     approved, rejected, history = [], [], []
 
+    scope = rawtags          # round 1 groups everything; rework narrows to disputes
+
     for round_no in range(1, MAX_ROUNDS + 1):
+        # Publish the round FIRST: creating proposals takes minutes, and a
+        # review submitted during that window would otherwise read a stale
+        # round and resolve an already-resolved promise, hanging the workflow.
+        ctx.set("round", round_no)
+
         equipment_list = await traced_run(ctx,
             f"discover_equipment_r{round_no}",
-            lambda fb=feedback: discover_equipment_from_rawtags(rawtags, device_types, feedback=fb)
+            lambda sc=scope, fb=feedback: discover_equipment_from_rawtags(sc, device_types, feedback=fb)
         )
         if not equipment_list:
             break
@@ -70,8 +77,6 @@ async def run(ctx: WorkflowContext, request: DiscoverRequest) -> dict:
         if not proposed:
             break
 
-        # Expose the round so the review handler resolves the right promise
-        ctx.set("round", round_no)
         decisions = await ctx.promise(f"review_{round_no}").value()
 
         _emit_event(component="restate.discovery", operation="human_review",
@@ -79,7 +84,7 @@ async def run(ctx: WorkflowContext, request: DiscoverRequest) -> dict:
                     payload={"round": round_no, "decisions": decisions})
 
         by_name = {p["equipment_name"]: p for p in proposed}
-        notes = []
+        notes, disputed_tags = [], set()
         for d in decisions or []:
             name = d.get("equipment_name")
             if name not in by_name:
@@ -90,6 +95,8 @@ async def run(ctx: WorkflowContext, request: DiscoverRequest) -> dict:
                     data_id=f"{request.tenant_id}:{name}")
                 approved.append(by_name[name])
             else:
+                # capture the tags BEFORE deleting — they're the rework scope
+                disputed_tags.update(by_name[name].get("rawtag_ids") or [])
                 await traced_run(ctx, f"reject_{name}_r{round_no}",
                     lambda n=name: graph.delete_equipment(request.tenant_id, n),
                     data_id=f"{request.tenant_id}:{name}")
@@ -103,9 +110,14 @@ async def run(ctx: WorkflowContext, request: DiscoverRequest) -> dict:
                         "feedback_items": len(notes)})
 
         # No actionable guidance -> nothing to rework, we're done
-        if not notes:
+        if not notes or round_no == MAX_ROUNDS:
             break
-        if round_no == MAX_ROUNDS:
+
+        # Rework ONLY the disputed tags. Re-running the whole grouping makes the
+        # LLM re-derive everything from scratch and it drifts badly (observed:
+        # a full re-run abandoned the good grouping for device-level buckets).
+        scope = [rt for rt in rawtags if rt.get("id") in disputed_tags]
+        if not scope:
             break
         feedback = "\n".join(notes)
 
@@ -174,6 +186,7 @@ def _create_proposals(equipment_list: list[dict], tenant_id: str,
             "equipment_name": name,
             "equipment_type": etype,
             "rawtag_count": len(rawtag_ids),
+            "rawtag_ids": rawtag_ids,   # rework scope if this gets rejected
             "status": "proposed",
         })
 
