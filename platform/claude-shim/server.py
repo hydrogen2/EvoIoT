@@ -43,7 +43,7 @@ CLI_ENV = {
 # (workflows send "openai/claude-code") are unaffected.
 def resolve_model(requested: str) -> str:
     r = (requested or "").lower()
-    for alias in ("opus", "sonnet", "haiku"):
+    for alias in ("opus", "sonnet", "haiku", "fable"):
         if alias in r:
             return alias
     return MODEL

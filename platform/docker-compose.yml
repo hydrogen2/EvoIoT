@@ -146,7 +146,9 @@ services:
       # Currently the claude-shim on the docker host (platform/claude-shim/),
       # which fronts the Claude Code CLI. LLM_API_KEY doubles as the shim's
       # bearer token (SHIM_TOKEN).
-      LLM_MODEL: ${LLM_MODEL:-openai/claude-code}
+      # Reasoning-heavy workflow steps (discovery, classification, extraction)
+      # run on Fable 5 via the shim; "fable" in the name routes the shim there.
+      LLM_MODEL: ${LLM_MODEL:-openai/fable}
       LLM_API_BASE: ${LLM_API_BASE:-http://host.docker.internal:8787/v1}
       LLM_API_KEY: ${LLM_API_KEY}
       FILE_STORE: /data/file_store

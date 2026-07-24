@@ -18,8 +18,25 @@ Rules:
 - Extract the equipment name WITHOUT the building prefix
 - Multiple raw tags belong to the same equipment if they share the same equipment portion of the name
 - Match each equipment to one of the available device types
-- Include ALL raw tags, even if you're unsure about the equipment type
-- If an object name doesn't clearly indicate equipment (e.g. a standalone sensor), group it as a standalone equipment
+
+Domain heuristics (these are the mistakes to avoid — learned from real plants):
+- PLANT / HEADER / SYSTEM points are NOT a piece of equipment. A prefix like
+  "CHPL", "*_Plant", "*_header", "*_system", "system_efficiency", "HeatLoad",
+  or plant-level totals describes the whole plant, not one device — do NOT
+  emit it as equipment. Leave such tags ungrouped.
+- Watch for INFIXES inside point names. A segment that appears in the MIDDLE of
+  many point names (e.g. "hli" in "CH_1_hli_raw_temp_chws") is part of the
+  point naming, NOT a separate device. Do not create equipment like "CH_1_hli"
+  or "CH_HLI" — those points belong to "CH_1".
+- DEDUPE name variants of the same physical unit. "CHWP_1" and "CHWPUMP_1" are
+  the same chilled-water pump; "CWP_2" and "CWPUMP_2" the same condenser pump.
+  Emit ONE equipment per physical unit, using the shortest canonical name.
+- Do NOT group by device/gateway id (e.g. "7777", "Rivervale_Chiller_7777",
+  "ModbusNetwork_*"). Those are network addresses, not equipment.
+- Vendor/driver point-groups (e.g. "SC-equip-App", raw controller internals
+  with no clear equipment name) are NOT physical equipment — leave ungrouped.
+- Prefer NOT emitting equipment over inventing a dubious one. Ungrouped tags
+  are fine; wrong equipment pollutes the model.
 
 Respond in JSON format only."""
 
@@ -110,7 +127,17 @@ Consider:
 - Object names often contain abbreviations (SAT=Supply Air Temp, RAT=Return Air Temp, OaT=Outdoor Air Temp, ChwST=Chilled Water Supply Temp, etc.)
 - Object types (analog-input, analog-output, binary-input, etc.)
 - Value ranges and units when available
-- The raw_data field may contain additional metadata
+
+Match the MEASURED value, not a related control point:
+- Prefer the raw sensor over a SETPOINT ("*_sp", "*_setpoint", "write_*") — a
+  setpoint is a target, not the measurement. Only pick a setpoint if the target
+  type is explicitly a setpoint.
+- Prefer this equipment's OWN point over a plant/header aggregate ("*_header",
+  "CHPL_*") — the header is a plant total, not this unit's reading.
+- Distinguish chilled water (chw/chws/chwr) from condenser water (cw/cws/cwr):
+  chws/chwr are the evaporator side, cws/cwr the condenser side.
+- If the only candidate is a setpoint or header when a real measurement is
+  wanted, return null with a low confidence rather than forcing a bad match.
 
 Respond in JSON format only."""
 
