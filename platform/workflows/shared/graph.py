@@ -219,7 +219,14 @@ def create_equipment_and_link(
         RETURN e
     """)
 
-    # MERGE Equipment --IS_TYPE_OF--> DeviceType
+    # Equipment --IS_TYPE_OF--> DeviceType. Drop any existing type edge first:
+    # a re-run that re-types the equipment must REPLACE the type, not add a
+    # second one (observed: PAHUs ending up typed both MAU and PAU).
+    execute_cypher(f"""
+        MATCH (e:Equipment {{id: '{equip_id}'}})-[t:IS_TYPE_OF]->(:DeviceType)
+        DELETE t
+        RETURN e
+    """)
     execute_cypher(f"""
         MATCH (e:Equipment {{id: '{equip_id}'}})
         MATCH (d:DeviceType {{name: '{equip_type_safe}'}})
