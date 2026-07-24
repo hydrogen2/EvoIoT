@@ -53,16 +53,54 @@ async def run(ctx: WorkflowContext, request: DiscoverRequest) -> dict:
     if not equipment_list:
         return {"status": "completed", "message": "No equipment discovered", "equipment": []}
 
-    # Step 4: Create Equipment nodes + BELONGS_TO edges
-    created = await traced_run(ctx,
-        "create_equipment",
+    # Step 4: Create Equipment nodes as PROPOSALS (status='proposed').
+    # Nothing is authoritative until a human ratifies it — an unreviewed LLM
+    # grouping reads as fact once it's in the graph (e.g. typing the plant
+    # 'CHPL' as a Chiller), and everything downstream inherits the mistake.
+    proposed = await traced_run(ctx,
+        "create_proposals",
         lambda: _create_proposals(equipment_list, request.tenant_id)
     )
 
+    # Step 5: Wait for human review (durably suspends until /review is called)
+    decisions = await ctx.promise("review").value()
+
+    _emit_event(
+        component="restate.discovery",
+        operation="human_review",
+        data_id=ctx.key(),
+        trace_id=ctx.key(),
+        actor="human",
+        payload={"decisions": decisions},
+    )
+
+    # Step 6: Apply decisions — approve keeps it, reject removes it entirely
+    approved, rejected = [], []
+    by_name = {p["equipment_name"]: p for p in proposed}
+    for d in decisions or []:
+        name = d.get("equipment_name")
+        if name not in by_name:
+            continue
+        if d.get("approved"):
+            await traced_run(ctx, f"approve_{name}",
+                lambda n=name: graph.update_equipment_status(request.tenant_id, n, "approved"),
+                data_id=f"{request.tenant_id}:{name}")
+            approved.append(by_name[name])
+        else:
+            await traced_run(ctx, f"reject_{name}",
+                lambda n=name: graph.delete_equipment(request.tenant_id, n),
+                data_id=f"{request.tenant_id}:{name}")
+            rejected.append(by_name[name])
+
+    # Anything the reviewer didn't mention stays 'proposed' — not authoritative.
+    undecided = [p for n, p in by_name.items()
+                 if n not in {d.get("equipment_name") for d in (decisions or [])}]
+
     return {
         "status": "completed",
-        "equipment_count": len(created),
-        "equipment": created,
+        "approved": approved,
+        "rejected": rejected,
+        "still_proposed": undecided,
     }
 
 
@@ -101,7 +139,7 @@ def _create_proposals(equipment_list: list[dict], tenant_id: str) -> list[dict]:
                 equipment_name=name,
                 equipment_type=etype,
                 rawtag_id=rawtag_id,
-                status="approved",
+                status="proposed",   # ratified only via the review handler
             )
 
         proposals.append({

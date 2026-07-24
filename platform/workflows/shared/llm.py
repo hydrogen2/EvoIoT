@@ -174,17 +174,15 @@ def discover_equipment_from_rawtags(
         f"- {dt.get('name', '')}: {dt.get('label', '')}" for dt in device_types
     )
 
-    # Send condensed rawtag info — only id, object_name, type, unit to stay within token limits
+    # Send condensed rawtag info — only id, object_name, type to stay within
+    # token limits. object_name is a flat property (it used to be buried in a
+    # raw_data blob); without it the LLM sees nameless tags and falls back to
+    # grouping by device id, which is useless.
     condensed = []
     for rt in rawtags:
-        raw_data = rt.get("raw_data", "")
-        # Extract object_name from raw_data string like "{...,object_name:UCS-2 FOO,...}"
-        obj_name = ""
-        if "object_name:" in raw_data:
-            obj_name = raw_data.split("object_name:")[1].split(",")[0].strip().rstrip("}")
         condensed.append({
             "id": rt.get("id", ""),
-            "name": obj_name,
+            "name": rt.get("object_name", ""),
             "type": rt.get("object_type", ""),
         })
     rawtags_str = json.dumps(condensed, default=str)
