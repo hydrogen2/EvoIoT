@@ -128,36 +128,17 @@ def rebuild_graph_from_claims() -> dict:
     graph.execute_cypher("MATCH (e:Equipment) DETACH DELETE e")
     graph.execute_cypher("MATCH (:RawTag)-[c:IS_TYPE_OF]->(:PropertyDef) DELETE c")
 
+    # Reuse the SAME _project_* helpers the incremental belief-writes use, so a
+    # full replay and a single claim produce identical graph state.
     for e in b["equipment"]:
-        eid = e["id"]
-        tenant, name = eid.split(":", 1)
-        nm = graph._sanitize_cypher_string(name)
-        et = graph._sanitize_cypher_string(e["type"])
-        st = graph._sanitize_cypher_string(e["status"])
-        graph.execute_cypher(f"MERGE (x:Equipment {{id: '{eid}'}}) RETURN x")
-        graph.execute_cypher(
-            f"MATCH (x:Equipment {{id: '{eid}'}}) "
-            f"SET x.name = '{nm}', x.tenant_id = '{tenant}', x.status = '{st}' RETURN x")
-        graph.execute_cypher(
-            f"MATCH (x:Equipment {{id: '{eid}'}}) MATCH (d:DeviceType {{name: '{et}'}}) "
-            f"MERGE (x)-[:IS_TYPE_OF]->(d) RETURN x")
+        tenant, name = e["id"].split(":", 1)
+        graph._project_equipment(tenant, name, e["type"], e["status"])
     for m in b["belongs_to"]:
-        graph.execute_cypher(
-            f"MATCH (r:RawTag {{id: '{m['rawtag']}'}}) MATCH (x:Equipment {{id: '{m['equip']}'}}) "
-            f"MERGE (r)-[:BELONGS_TO]->(x) RETURN r")
+        graph._project_belongs_to(m["rawtag"], m["equip"])
     for c in b["classifications"]:
-        p = graph._sanitize_cypher_string(c["property"])
-        st = graph._sanitize_cypher_string(c["status"])
-        conf = c.get("confidence") if c.get("confidence") is not None else 0.0
-        reason = graph._sanitize_cypher_string(c.get("reason") or "")
-        # AGE does not persist SET on an edge in the same query as its MERGE
-        # (works in psql, not via psycopg2) — split, as create_is_type_of_edge does.
-        graph.execute_cypher(
-            f"MATCH (r:RawTag {{id: '{c['rawtag']}'}}) MATCH (p:PropertyDef {{name: '{p}'}}) "
-            f"MERGE (r)-[e:IS_TYPE_OF]->(p) RETURN r")
-        graph.execute_cypher(
-            f"MATCH (r:RawTag {{id: '{c['rawtag']}'}})-[e:IS_TYPE_OF]->(p:PropertyDef {{name: '{p}'}}) "
-            f"SET e.status = '{st}', e.confidence = {conf}, e.reason = '{reason}' RETURN e")
+        graph._project_classification(c["rawtag"], c["property"], c["status"],
+                                      confidence=c.get("confidence") if c.get("confidence") is not None else 0.0,
+                                      reason=c.get("reason") or "")
     return {k: len(v) for k, v in b.items()}
 
 

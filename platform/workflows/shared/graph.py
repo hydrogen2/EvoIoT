@@ -220,6 +220,78 @@ def get_device_types() -> list[dict]:
     return parsed
 
 
+# ── Graph projection (Stage 3) ──────────────────────────────────────
+# The graph is a derived cache. These _project_* helpers are the ONLY writers
+# of the projected subgraph (Equipment + edges, RawTag classifications), driven
+# by claims. Both the incremental path (belief-writes, below) and the batch
+# path (projector.rebuild_graph_from_claims) go through them, so a single claim
+# and a full replay produce identical graph state.
+
+def _project_equipment(tenant_id: str, equipment_name: str,
+                       equipment_type: str, status: str) -> None:
+    """Materialize an equipment's existence + type + status from a claim."""
+    equip_id = f"{tenant_id}:{equipment_name}"
+    name = _sanitize_cypher_string(equipment_name)
+    etype = _sanitize_cypher_string(equipment_type)
+    st = _sanitize_cypher_string(status)
+    execute_cypher(f"MERGE (e:Equipment {{id: '{equip_id}'}}) RETURN e")
+    # SET props separately (AGE MERGE+SET quirk)
+    execute_cypher(f"MATCH (e:Equipment {{id: '{equip_id}'}}) "
+                   f"SET e.name = '{name}', e.tenant_id = '{tenant_id}', e.status = '{st}' RETURN e")
+    # Replace the type edge (re-typing must not leave a second IS_TYPE_OF)
+    execute_cypher(f"MATCH (e:Equipment {{id: '{equip_id}'}})-[t:IS_TYPE_OF]->(:DeviceType) "
+                   f"DELETE t RETURN e")
+    execute_cypher(f"MATCH (e:Equipment {{id: '{equip_id}'}}) MATCH (d:DeviceType {{name: '{etype}'}}) "
+                   f"MERGE (e)-[:IS_TYPE_OF]->(d) RETURN e")
+
+
+def _project_belongs_to(rawtag_id: str, equip_id: str) -> None:
+    execute_cypher(f"MATCH (r:RawTag {{id: '{rawtag_id}'}}) MATCH (e:Equipment {{id: '{equip_id}'}}) "
+                   f"MERGE (r)-[:BELONGS_TO]->(e) RETURN r")
+
+
+def _project_equipment_status(equip_id: str, status: str) -> None:
+    st = _sanitize_cypher_string(status)
+    execute_cypher(f"MATCH (e:Equipment {{id: '{equip_id}'}}) SET e.status = '{st}' RETURN e")
+
+
+def _retract_equipment(equip_id: str) -> None:
+    execute_cypher(f"MATCH (e:Equipment {{id: '{equip_id}'}}) "
+                   f"OPTIONAL MATCH ()-[b:BELONGS_TO]->(e) OPTIONAL MATCH (e)-[t:IS_TYPE_OF]->() "
+                   f"DELETE b, t, e RETURN count(*)")
+
+
+def _project_classification(rawtag_id: str, property_name: str, status: str,
+                            confidence: float | None = None, reason: str | None = None,
+                            approved_by: str | None = None, feedback: str | None = None) -> None:
+    """Materialize a RawTag classification from a claim. confidence/reason are
+    only written when provided, so a status-only ratification preserves them."""
+    prop = _sanitize_cypher_string(property_name)
+    execute_cypher(f"MATCH (r:RawTag {{id: '{rawtag_id}'}}) MATCH (p:PropertyDef {{name: '{prop}'}}) "
+                   f"MERGE (r)-[e:IS_TYPE_OF]->(p) RETURN r")
+    sets = [f"e.status = '{_sanitize_cypher_string(status)}'"]
+    if confidence is not None:
+        sets.append(f"e.confidence = {confidence}")
+    if reason is not None:
+        sets.append(f"e.reason = '{_sanitize_cypher_string(reason)}'")
+    if status == "approved" and approved_by:
+        sets.append(f"e.approved_at = {int(time.time() * 1000)}")
+        sets.append(f"e.approved_by = '{_sanitize_cypher_string(approved_by)}'")
+    if feedback:
+        sets.append(f"e.feedback = '{_sanitize_cypher_string(feedback)}'")
+    execute_cypher(f"MATCH (r:RawTag {{id: '{rawtag_id}'}})-[e:IS_TYPE_OF]->(p:PropertyDef {{name: '{prop}'}}) "
+                   f"SET {', '.join(sets)} RETURN e")
+
+
+def _require_claim(cid: int | None, what: str) -> None:
+    """The claims log is the source of truth (Stage 3): if it can't record the
+    belief, the operation fails rather than mutating a derived cache silently."""
+    if cid is None:
+        raise RuntimeError(f"claims log write failed: {what}")
+
+
+# ── Belief-writes: append the claim (source of truth), then project ─
+
 def create_equipment_and_link(
     tenant_id: str,
     equipment_name: str,
@@ -227,98 +299,42 @@ def create_equipment_and_link(
     rawtag_id: str,
     status: str = "approved",
 ) -> None:
-    """Create Equipment node, link it to DeviceType, and link RawTag to it.
-
-    Equipment ID = {tenant_id}:{equipment_name}
-    Creates:
-      Equipment --IS_TYPE_OF--> DeviceType
-      RawTag --BELONGS_TO--> Equipment
-    """
+    """Assert equipment type + membership. The claim is authoritative; the graph
+    is the write-through projection of it."""
     if not equipment_name or not equipment_type:
         return
-
     equip_id = f"{tenant_id}:{equipment_name}"
-    equip_name_safe = _sanitize_cypher_string(equipment_name)
-    equip_type_safe = _sanitize_cypher_string(equipment_type)
-
-    print(f"[graph] Creating Equipment: {equip_id} (type={equipment_type}, status={status})", flush=True)
-
-    # MERGE Equipment node
-    execute_cypher(f"""
-        MERGE (e:Equipment {{id: '{equip_id}'}})
-        RETURN e
-    """)
-    # SET properties separately (AGE MERGE+SET bug)
-    execute_cypher(f"""
-        MATCH (e:Equipment {{id: '{equip_id}'}})
-        SET e.name = '{equip_name_safe}',
-            e.tenant_id = '{tenant_id}',
-            e.status = '{status}'
-        RETURN e
-    """)
-
-    # Equipment --IS_TYPE_OF--> DeviceType. Drop any existing type edge first:
-    # a re-run that re-types the equipment must REPLACE the type, not add a
-    # second one (observed: PAHUs ending up typed both MAU and PAU).
-    execute_cypher(f"""
-        MATCH (e:Equipment {{id: '{equip_id}'}})-[t:IS_TYPE_OF]->(:DeviceType)
-        DELETE t
-        RETURN e
-    """)
-    execute_cypher(f"""
-        MATCH (e:Equipment {{id: '{equip_id}'}})
-        MATCH (d:DeviceType {{name: '{equip_type_safe}'}})
-        MERGE (e)-[:IS_TYPE_OF]->(d)
-        RETURN e
-    """)
-
-    # MERGE RawTag --BELONGS_TO--> Equipment
-    execute_cypher(f"""
-        MATCH (r:RawTag {{id: '{rawtag_id}'}})
-        MATCH (e:Equipment {{id: '{equip_id}'}})
-        MERGE (r)-[:BELONGS_TO]->(e)
-        RETURN r
-    """)
-
+    payload = {"tenant_id": tenant_id, "equipment_name": equipment_name}
+    _require_claim(append_claim(equip_id, "is_type_of", equipment_type, status, payload=payload),
+                   f"{equip_id} is_type_of {equipment_type}")
+    _require_claim(append_claim(rawtag_id, "belongs_to", equip_id, status, payload=payload),
+                   f"{rawtag_id} belongs_to {equip_id}")
+    _project_equipment(tenant_id, equipment_name, equipment_type, status)
+    _project_belongs_to(rawtag_id, equip_id)
     print(f"[graph] Linked RawTag {rawtag_id} -> Equipment {equip_id} -> DeviceType {equipment_type}", flush=True)
-
-    # Dual-write claims (Stage 1). The type claim repeats per rawtag (this fn is
-    # called once per member); that's idempotent — the projector folds by
-    # (subject, predicate) to the latest. belongs_to is genuinely per-rawtag.
-    append_claim(equip_id, "is_type_of", equipment_type, status,
-                 payload={"tenant_id": tenant_id, "equipment_name": equipment_name})
-    append_claim(rawtag_id, "belongs_to", equip_id, status,
-                 payload={"tenant_id": tenant_id, "equipment_name": equipment_name})
 
 
 def update_equipment_status(tenant_id: str, equipment_name: str, status: str) -> None:
-    """Update the status of an Equipment node."""
+    """Ratify an equipment (status transition). Claim first, then project."""
     equip_id = f"{tenant_id}:{equipment_name}"
-    execute_cypher(f"""
-        MATCH (e:Equipment {{id: '{equip_id}'}})
-        SET e.status = '{status}'
-        RETURN e
-    """)
+    payload = {"tenant_id": tenant_id, "equipment_name": equipment_name}
+    _require_claim(append_claim(equip_id, "ratified", status, status, payload=payload),
+                   f"{equip_id} ratified {status}")
+    if status == "retracted":
+        _retract_equipment(equip_id)
+    else:
+        _project_equipment_status(equip_id, status)
     print(f"[graph] Equipment {equip_id} status -> {status}", flush=True)
-    # Dual-write: a ratification is a new claim that supersedes the proposal.
-    append_claim(equip_id, "ratified", status, status,
-                 payload={"tenant_id": tenant_id, "equipment_name": equipment_name})
 
 
 def delete_equipment(tenant_id: str, equipment_name: str) -> None:
-    """Delete an Equipment node and its BELONGS_TO edges."""
+    """Retract an equipment. Recorded as a retraction claim, not an erasure."""
     equip_id = f"{tenant_id}:{equipment_name}"
-    execute_cypher(f"""
-        MATCH (e:Equipment {{id: '{equip_id}'}})
-        OPTIONAL MATCH ()-[b:BELONGS_TO]->(e)
-        OPTIONAL MATCH (e)-[t:IS_TYPE_OF]->()
-        DELETE b, t, e
-        RETURN count(*)
-    """)
+    payload = {"tenant_id": tenant_id, "equipment_name": equipment_name}
+    _require_claim(append_claim(equip_id, "ratified", "retracted", "retracted", payload=payload),
+                   f"{equip_id} retracted")
+    _retract_equipment(equip_id)
     print(f"[graph] Deleted Equipment {equip_id}", flush=True)
-    # Dual-write: deletion is a retraction claim, not an erasure of history.
-    append_claim(equip_id, "ratified", "retracted", "retracted",
-                 payload={"tenant_id": tenant_id, "equipment_name": equipment_name})
 
 
 def get_pending_equipment() -> list[dict]:
@@ -371,42 +387,15 @@ def create_is_type_of_edge(
     confidence: float = 0.0,
     reason: str = ""
 ) -> dict:
-    """Create an IS_TYPE_OF edge between RawTag and PropertyDef."""
-    timestamp = int(time.time() * 1000)
-    reason_safe = _sanitize_cypher_string(reason)
-
-    # MERGE to ensure the edge exists
-    merge_query = f"""
-        MATCH (r:RawTag {{id: '{rawtag_id}'}})
-        MATCH (p:PropertyDef {{name: '{property_name}'}})
-        MERGE (r)-[e:IS_TYPE_OF]->(p)
-        RETURN e
-    """
-    print(f"[graph] Creating IS_TYPE_OF: {rawtag_id} -> {property_name} (confidence={confidence})", flush=True)
-    execute_cypher(merge_query)
-
-    # SET properties separately — AGE doesn't persist SET on edges when
-    # combined with MERGE in the same query via psycopg2 (works in psql).
-    set_query = f"""
-        MATCH (r:RawTag {{id: '{rawtag_id}'}})-[e:IS_TYPE_OF]->(p:PropertyDef {{name: '{property_name}'}})
-        SET e.status = '{status}',
-            e.confidence = {confidence},
-            e.reason = '{reason_safe}',
-            e.proposed_at = {timestamp},
-            e.approved_at = null,
-            e.approved_by = null,
-            e.feedback = null
-        RETURN e
-    """
-    results = execute_cypher(set_query)
-    if results:
-        print(f"[graph] IS_TYPE_OF edge properties set: {results[0]}", flush=True)
-    else:
-        print(f"[graph] WARNING: IS_TYPE_OF SET returned empty for {rawtag_id} -> {property_name}", flush=True)
-    # Dual-write: the classification is a claim about this rawtag.
-    append_claim(rawtag_id, "classified_as", property_name, status,
-                 payload={"confidence": confidence, "reason": reason})
-    return results[0] if results else {}
+    """Classify a RawTag. The claim is authoritative; the edge is its projection."""
+    print(f"[graph] Classifying: {rawtag_id} -> {property_name} (confidence={confidence})", flush=True)
+    _require_claim(
+        append_claim(rawtag_id, "classified_as", property_name, status,
+                     payload={"confidence": confidence, "reason": reason}),
+        f"{rawtag_id} classified_as {property_name}")
+    _project_classification(rawtag_id, property_name, status,
+                            confidence=confidence, reason=reason)
+    return {}
 
 
 def get_pending_proposals() -> list[dict]:
@@ -443,25 +432,12 @@ def update_is_type_of_status(
     approved_by: str | None = None,
     feedback: str | None = None
 ) -> dict:
-    """Update the status of an IS_TYPE_OF edge."""
-    set_clauses = [f"e.status = '{status}'"]
-    if status == "approved" and approved_by:
-        timestamp = int(time.time() * 1000)
-        set_clauses.append(f"e.approved_at = {timestamp}")
-        set_clauses.append(f"e.approved_by = '{approved_by}'")
-    if feedback:
-        set_clauses.append(f"e.feedback = '{_sanitize_cypher_string(feedback)}'")
-
-    set_clause = ", ".join(set_clauses)
-
-    query = f"""
-        MATCH (r:RawTag {{id: '{rawtag_id}'}})-[e:IS_TYPE_OF]->(p:PropertyDef {{name: '{property_name}'}})
-        SET {set_clause}
-        RETURN e
-    """
-    results = execute_cypher(query)
-    # Dual-write: re-assert the classification claim at the new status
-    # (supersedes the proposal); single predicate carries the lifecycle.
-    append_claim(rawtag_id, "classified_as", property_name, status,
-                 payload={"approved_by": approved_by, "feedback": feedback})
-    return results[0] if results else {}
+    """Ratify a classification (status transition). Claim first, then project."""
+    _require_claim(
+        append_claim(rawtag_id, "classified_as", property_name, status,
+                     payload={"approved_by": approved_by, "feedback": feedback}),
+        f"{rawtag_id} classified_as {property_name} ({status})")
+    # Re-project at the new status; confidence/reason omitted so they're preserved.
+    _project_classification(rawtag_id, property_name, status,
+                            approved_by=approved_by, feedback=feedback)
+    return {}
