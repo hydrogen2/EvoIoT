@@ -85,6 +85,44 @@ def _emit_graph_event(operation: str, data_id: str | None, query: str):
         logger.warning("Failed to emit graph event: %s", e)
 
 
+def append_claim(subject: str, predicate: str, obj: str | None, status: str,
+                 actor: str = "restate", component: str = "graph",
+                 supersedes_id: int | None = None,
+                 payload: dict | None = None) -> int | None:
+    """Append a belief-bearing event — a CLAIM — to the authoritative claims log
+    (the belief-bearing subset of evoiot.events).
+
+    Stage 1 is DUAL-WRITE: this is called alongside the graph mutation. The
+    graph stays the primary read model until the Stage-2 projector can rebuild
+    it from these claims, so a claims-log failure must never break the graph
+    write — hence swallow-and-warn.
+
+    Belief is recorded append-only: a change is a new claim
+    (proposed → approved → retracted), never an in-place edit. The projector
+    folds the latest claim per (subject, predicate) into the graph.
+    """
+    try:
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO evoiot.events
+                         (component, operation, data_id, actor, payload,
+                          claim_predicate, claim_object, claim_status, supersedes_id)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                       RETURNING id""",
+                    (component, f"claim_{predicate}", subject, actor,
+                     json.dumps(payload or {}, default=str),
+                     predicate, obj, status, supersedes_id))
+                return cur.fetchone()[0]
+        finally:
+            conn.close()
+    except Exception as e:  # never let the claims log break the primary write
+        logger.warning("append_claim failed (%s %s -> %s @ %s): %s",
+                       subject, predicate, obj, status, e)
+        return None
+
+
 def _sanitize_cypher_string(value: str) -> str:
     """Sanitize a string value for use inside Cypher single-quoted literals.
 
@@ -244,6 +282,14 @@ def create_equipment_and_link(
 
     print(f"[graph] Linked RawTag {rawtag_id} -> Equipment {equip_id} -> DeviceType {equipment_type}", flush=True)
 
+    # Dual-write claims (Stage 1). The type claim repeats per rawtag (this fn is
+    # called once per member); that's idempotent — the projector folds by
+    # (subject, predicate) to the latest. belongs_to is genuinely per-rawtag.
+    append_claim(equip_id, "is_type_of", equipment_type, status,
+                 payload={"tenant_id": tenant_id, "equipment_name": equipment_name})
+    append_claim(rawtag_id, "belongs_to", equip_id, status,
+                 payload={"tenant_id": tenant_id, "equipment_name": equipment_name})
+
 
 def update_equipment_status(tenant_id: str, equipment_name: str, status: str) -> None:
     """Update the status of an Equipment node."""
@@ -254,6 +300,9 @@ def update_equipment_status(tenant_id: str, equipment_name: str, status: str) ->
         RETURN e
     """)
     print(f"[graph] Equipment {equip_id} status -> {status}", flush=True)
+    # Dual-write: a ratification is a new claim that supersedes the proposal.
+    append_claim(equip_id, "ratified", status, status,
+                 payload={"tenant_id": tenant_id, "equipment_name": equipment_name})
 
 
 def delete_equipment(tenant_id: str, equipment_name: str) -> None:
@@ -267,6 +316,9 @@ def delete_equipment(tenant_id: str, equipment_name: str) -> None:
         RETURN count(*)
     """)
     print(f"[graph] Deleted Equipment {equip_id}", flush=True)
+    # Dual-write: deletion is a retraction claim, not an erasure of history.
+    append_claim(equip_id, "ratified", "retracted", "retracted",
+                 payload={"tenant_id": tenant_id, "equipment_name": equipment_name})
 
 
 def get_pending_equipment() -> list[dict]:
@@ -351,6 +403,9 @@ def create_is_type_of_edge(
         print(f"[graph] IS_TYPE_OF edge properties set: {results[0]}", flush=True)
     else:
         print(f"[graph] WARNING: IS_TYPE_OF SET returned empty for {rawtag_id} -> {property_name}", flush=True)
+    # Dual-write: the classification is a claim about this rawtag.
+    append_claim(rawtag_id, "classified_as", property_name, status,
+                 payload={"confidence": confidence, "reason": reason})
     return results[0] if results else {}
 
 
@@ -405,4 +460,8 @@ def update_is_type_of_status(
         RETURN e
     """
     results = execute_cypher(query)
+    # Dual-write: re-assert the classification claim at the new status
+    # (supersedes the proposal); single predicate carries the lifecycle.
+    append_claim(rawtag_id, "classified_as", property_name, status,
+                 payload={"approved_by": approved_by, "feedback": feedback})
     return results[0] if results else {}

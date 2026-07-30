@@ -657,6 +657,15 @@ CREATE TABLE evoiot.events (
     trace_id    TEXT,                       -- request-level correlation
     actor       TEXT,                       -- bento, doubao-v3, user@company.com
     payload     JSONB,                      -- context, flexible per operation
+    -- Belief-bearing (claim) fields — NULL for pure ops/audit rows. Rows with
+    -- claim_predicate NOT NULL are the authoritative CLAIMS LOG (the strongest
+    -- reading of this stream: logging ⊂ provenance ⊂ audit ⊂ claims/belief).
+    -- The AGE graph is a projection folded from these; belief changes are
+    -- append-only claims (proposed/approved/retracted), never in-place edits.
+    claim_predicate TEXT,                   -- is_type_of | belongs_to | classified_as | ratified
+    claim_object    TEXT,                   -- asserted value (type, equip id, property, status)
+    claim_status    TEXT,                   -- proposed | approved | rejected | retracted
+    supersedes_id   BIGINT,                 -- prior event this claim supersedes (NULL = new)
     PRIMARY KEY (id)
 );
 
@@ -665,6 +674,10 @@ CREATE INDEX events_data_id_idx ON evoiot.events (data_id, event_time) WHERE dat
 CREATE INDEX events_component_idx ON evoiot.events (component, event_time);
 CREATE INDEX events_actor_idx ON evoiot.events (actor, event_time) WHERE actor IS NOT NULL;
 CREATE INDEX events_trace_id_idx ON evoiot.events (trace_id, event_time) WHERE trace_id IS NOT NULL;
+-- Fold index: latest claim per (subject, predicate) — the read path the Stage-2
+-- projector uses to derive current belief from the claims log.
+CREATE INDEX events_claim_idx ON evoiot.events (data_id, claim_predicate, id DESC)
+    WHERE claim_predicate IS NOT NULL;
 
 -- Append-only: grant INSERT only, explicitly revoke UPDATE/DELETE
 GRANT INSERT ON evoiot.events TO bento_writer, workflow_rw, postgrest_role;
