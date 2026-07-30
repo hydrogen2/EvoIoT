@@ -111,17 +111,30 @@ def run_cycle(source_id: str, watermark):
     readings, new_watermark = source.pull(watermark)
 
     if readings:
-        _publish(config, readings)
+        _publish(config, readings, _resolve_bms_scope(config, source_id))
     return len(readings), new_watermark, interval, "ok"
 
 
-def _publish(config: dict, readings: list):
-    """Publish readings as telemetry (MQTT → Bento → readings), keyed by raw
-    BACnet identity. rawtag_id is stated explicitly so it joins existing
-    RawTags regardless of which evidence source reported the point."""
+def _resolve_bms_scope(config: dict, source_id: str) -> str:
+    """Resolve the BMS this collector observes (by building/edge) and record the
+    datasource—observes→BMS claim, so wire readings key on bms:device:object —
+    the same coordinate the file export and BACnet scan produce for that BMS."""
+    from shared import graph
+    tenant = config["tenant"]
+    building = resolve_namespace(config)
+    ref = (config.get("transport") or {}).get("ref")
+    edge = (_load_config_map(tenant, ref).get("ssh") or {}).get("host") if ref else None
+    bms_id = graph.resolve_bms(tenant, building, edge=edge)
+    graph.ensure_observes(source_id, bms_id)
+    return bms_id
+
+
+def _publish(config: dict, readings: list, bms_id: str):
+    """Publish readings as telemetry (MQTT → Bento → readings), keyed by the
+    BMS-scoped coordinate bms:device:object so they join existing RawTags
+    regardless of which evidence source reported the point."""
     tenant = config["tenant"]
     agent = config.get("agent_id", "collector")
-    ns = resolve_namespace(config)   # building name, not the source
     topic = f"tenants/{tenant}/agents/{agent}/telemetry"
 
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"collector-{agent}")
@@ -129,7 +142,7 @@ def _publish(config: dict, readings: list):
     client.loop_start()
     try:
         for r in readings:
-            rawtag_id = f"{tenant}:{ns}:{r['device_id']}:{r['object_type']}:{r['object_instance']}"
+            rawtag_id = f"{bms_id}:{r['device_id']}:{r['object_type']}:{r['object_instance']}"
             payload = {
                 "tenant_id": tenant, "agent_id": agent,
                 "rawtag_id": rawtag_id, "device_id": r["device_id"],

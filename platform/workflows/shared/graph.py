@@ -266,6 +266,22 @@ def assert_file_export_of_bms(sha256: str, bms_id: str, actor: str = "extraction
     append_claim(sha256, "is_export_of", bms_id, "approved", actor=actor)
 
 
+def ensure_observes(datasource_id: str, bms_id: str, actor: str = "collector") -> None:
+    """Record (once) that a datasource observes a BMS — the collector-side twin
+    of is_export_of. Guarded so the pull loop doesn't re-assert every cycle."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT 1 FROM evoiot.events
+                   WHERE claim_predicate = 'observes' AND data_id = %s AND claim_object = %s
+                   LIMIT 1""", (str(datasource_id), bms_id))
+            if cur.fetchone() is None:
+                append_claim(str(datasource_id), "observes", bms_id, "approved", actor=actor)
+    finally:
+        conn.close()
+
+
 def rawtag_coordinate(bms_id: str, device_id: str, object_type: str, object_instance: str) -> str:
     """BMS-scoped rawtag coordinate: bms:device:object_type:object_instance.
     All datasources of one BMS report the same coordinate for the same point,

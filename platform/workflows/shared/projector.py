@@ -67,9 +67,22 @@ def current_belief() -> dict:
                         "confidence": (r[3] or {}).get("confidence"),
                         "reason": (r[3] or {}).get("reason")}
                        for r in cur.fetchall() if r[2] in MATERIALIZE]
+
+            # BMS entities (the physical observation channel) — projected so
+            # resolve_bms works after a rebuild.
+            cur.execute("""
+                SELECT DISTINCT ON (data_id) data_id, claim_object, claim_status, payload
+                FROM evoiot.events WHERE claim_predicate = 'bms_exists'
+                ORDER BY data_id, id DESC
+            """)
+            bms = [{"id": r[0], "building": r[1],
+                    "tenant": (r[3] or {}).get("tenant_id"),
+                    "edge": (r[3] or {}).get("edge")}
+                   for r in cur.fetchall() if r[2] in MATERIALIZE]
     finally:
         conn.close()
-    return {"equipment": equipment, "belongs_to": belongs, "classifications": classes}
+    return {"equipment": equipment, "belongs_to": belongs,
+            "classifications": classes, "bms": bms}
 
 
 # ── Snapshot: current graph → belief (for verification) ─────────────
@@ -135,7 +148,11 @@ def rebuild_graph_from_claims() -> dict:
     through the dual-write path, so it emits no new claims."""
     b = current_belief()
     graph.execute_cypher("MATCH (e:Equipment) DETACH DELETE e")
+    graph.execute_cypher("MATCH (m:BMS) DETACH DELETE m")
     graph.execute_cypher("MATCH (:RawTag)-[c:IS_TYPE_OF]->(:PropertyDef) DELETE c")
+
+    for m in b.get("bms", []):
+        graph._project_bms(m["id"], m.get("tenant") or "", m.get("building") or "", m.get("edge"))
 
     # Reuse the SAME _project_* helpers the incremental belief-writes use, so a
     # full replay and a single claim produce identical graph state.

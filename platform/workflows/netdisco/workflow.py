@@ -23,6 +23,7 @@ from restate import VirtualObject, ObjectContext
 
 from collectors.framework import _load_config_map, _connect, resolve_namespace
 from collectors.transport import SshTransport
+from shared import graph
 from shared.traced import traced_run
 
 # BACnet object-type enum → dashed name (matches the file extraction's forms so
@@ -43,13 +44,13 @@ def _load_bacnet_source(tenant: str):
     conn = _connect()
     try:
         with conn.cursor() as cur:
-            cur.execute("""SELECT config FROM evoiot.data_sources
+            cur.execute("""SELECT id, config FROM evoiot.data_sources
                            WHERE source_type = 'bacnet' AND config->>'tenant' = %s
                              AND enabled LIMIT 1""", (tenant,))
             row = cur.fetchone()
     finally:
         conn.close()
-    return (row[0] if row else None)
+    return (row if row else (None, None))
 
 
 def _transport(tenant: str, edge_ref: str) -> SshTransport:
@@ -81,20 +82,20 @@ def _scan(transport: SshTransport, tools_dir: str, window: int, timeout: float):
     return devices
 
 
-def _fuse(tenant: str, namespace: str, devices: list) -> dict:
-    """Fuse the scan into the graph. Returns counts."""
+def _fuse(tenant: str, namespace: str, bms_id: str, devices: list) -> dict:
+    """Fuse the scan into the graph with BMS-scoped coordinates. Returns counts."""
     conn = _connect()
     stats = {"devices": 0, "objects": 0, "skipped": 0}
     try:
         with conn.cursor() as cur:
             # upsert_rawtag(tenant, building, device, otype, oinst, tag_type,
-            #   origin, evidence, object_name, unit, value_sample, path, ip, port)
+            #   origin, evidence, object_name, unit, value_sample, path, ip, port, bms)
             for d in devices:
                 dev = str(d["device"])
-                cur.execute("SELECT evoiot.upsert_rawtag(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                cur.execute("SELECT evoiot.upsert_rawtag(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                             (tenant, namespace, dev, None, None, "device",
                              "wire", "bacnet:whois", None, None, None, None,
-                             d.get("ip"), str(d.get("port") or "")))
+                             d.get("ip"), str(d.get("port") or ""), bms_id))
                 stats["devices"] += 1
                 for o in d.get("objects", []):
                     otype_num = o.get("type")
@@ -102,10 +103,10 @@ def _fuse(tenant: str, namespace: str, devices: list) -> dict:
                         stats["skipped"] += 1
                         continue
                     otype = OBJ_TYPE_NAME.get(otype_num, f"type-{otype_num}")
-                    cur.execute("SELECT evoiot.upsert_rawtag(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    cur.execute("SELECT evoiot.upsert_rawtag(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                                 (tenant, namespace, dev, otype, str(o["instance"]),
                                  "object", "wire", "bacnet:objectlist",
-                                 o.get("name"), None, None, None, None, None))
+                                 o.get("name"), None, None, None, None, None, bms_id))
                     stats["objects"] += 1
     finally:
         conn.close()
@@ -117,12 +118,15 @@ async def scan(ctx: ObjectContext, request: dict) -> dict:
     """Full inventory scan keyed by tenant. Config from the tenant's registered
     bacnet data source; edge access from the config-map seed it references."""
     tenant = (request or {}).get("tenant") or ctx.key()
-    config = _load_bacnet_source(tenant)
+    bacnet_source_id, config = _load_bacnet_source(tenant)
     if config is None:
         return {"status": "no_source", "message": f"no bacnet data source for {tenant}"}
 
     edge_ref = (config.get("transport") or {}).get("ref", "rp-edge")
     namespace = resolve_namespace(config)   # building name (from the seed)
+    edge_host = (_load_config_map(tenant, edge_ref).get("ssh") or {}).get("host")
+    bms_id = graph.resolve_bms(tenant, namespace, edge=edge_host)
+    graph.ensure_observes(bacnet_source_id, bms_id)
     b = config.get("bacnet", {})
     tools_dir = b.get("tool_dir", "/home/envuser/bacnet-tools")
     window = int(b.get("window", 8))
@@ -136,7 +140,7 @@ async def scan(ctx: ObjectContext, request: dict) -> dict:
         return {"status": "completed", "message": "no devices", "devices": []}
 
     stats = await traced_run(ctx, "fuse_inventory",
-        lambda: _fuse(tenant, namespace, devices), data_id=tenant)
+        lambda: _fuse(tenant, namespace, bms_id, devices), data_id=tenant)
 
     return {"status": "completed",
             "discovered_devices": [{"device": d["device"], "ip": d.get("ip"),
