@@ -267,23 +267,42 @@ Two ways to answer historical questions, chosen by demand:
 
 ### Current implementation vs target
 
-Honest status — this section is the conceptual foundation; the running system
-approximates it and collapses parts of it for now:
+Honest status — the running system now implements the belief substrate as
+event sourcing + ratification (Stages 1–4a); some pieces remain deferred by
+the just-in-time principle (don't build a distinction until a use case demands
+it):
 
-- The conceptual log is today **materialized across three stores**: `readings`
-  (observation fragments), the AGE graph (entities + classifications, whose
-  `status` is a crude materialized projection), and [`evoiot.events`](#unified-events)
-  (provenance/audit). These are projections of the one conceptual log, not a
-  literal single event-sourced store.
-- `rawtag_id` currently embeds `tenant:building:device:object_type:object_instance`.
-  The **channel-scoped coordinate + surrogate key + link-based tenant/building**
-  is the target (it removes the migration cliff already paid once on a building
-  rename).
-- `propose → review → ratify` exists for classification and equipment discovery;
-  extending it *uniformly* — including auto-ratified observations and
-  resolution/binding decisions — is the direction.
-- Full event-sourcing / bitemporality is a direction (see
-  [v1 graph — no bitemporality](#v1-graph-current-topology-no-bitemporality)).
+**Built:**
+- **Claims log (`evoiot.events`, belief-bearing subset).** The rows with
+  `claim_predicate NOT NULL` (`is_type_of`, `belongs_to`, `classified_as`,
+  `ratified`) are the authoritative claims log. Belief is recorded append-only
+  — a change is a new superseding claim, never an in-place edit.
+- **Graph is a derived projection.** `shared/projector.py` folds the claims log
+  into the AGE graph; `rebuild_graph_from_claims()` is a pure function of the
+  log (two rebuilds are byte-identical). The belief-writes append the claim
+  first (authoritatively — a failed claim aborts) and project through the same
+  `_project_*` helpers the batch rebuild uses, so incremental and replay agree.
+  `GRAPH == FOLD(claims)` holds after every write.
+- **Equipment identity is building-scoped** (`tenant:building:name`), so RP's
+  CH_1 and LP's CH_1 are distinct (they had collided under `tenant:name`). The
+  read RPC, discovery review, classifier, and chatapp all resolve equipment
+  building-scoped.
+
+**Deferred (by the JIT principle — no present use case):**
+- `readings` is still a *separate* physical log from `evoiot.events` — correct
+  (numeric head vs structural tail have different physics), not a gap.
+- **Surrogate keys (4b):** equipment id is still a building-scoped *natural*
+  key (`name` in the id). Decoupling it from the mutable name needs
+  signature-based entity resolution; its payoff (robustness to AI naming drift
+  across re-runs, cross-source mention→entity fusion) isn't demanded until we
+  re-run discovery or fuse doc/screenshot mentions.
+- **Channel-scoped rawtag coordinate (4c):** `rawtag_id` still embeds
+  `tenant:building:device:object_type:object_instance`; re-keying onto
+  `<channel>` (building → a link) is warranted when a building rename or edge
+  swap actually happens.
+- Auto-ratified observations as claims, and full bitemporality (see
+  [v1 graph — no bitemporality](#v1-graph-current-topology-no-bitemporality)),
+  remain directions.
 
 ---
 
