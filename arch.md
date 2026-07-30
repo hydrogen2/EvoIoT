@@ -74,6 +74,219 @@ The system grows along two axes, and never by re-architecting:
 
 ---
 
+## Foundations — Substrate & Ratification (the two knots)
+
+Everything above — the resolution chain, the graph, the apps — is a *projection*
+that can be wrong today and rebuilt tomorrow. This section is the part that
+**cannot** be rebuilt from anything higher, and therefore the part we freeze.
+
+### What to freeze, what to keep fluid (the bowtie)
+
+Durable systems don't come from a clever, future-proof model — you can't proof a
+model against use cases you haven't met; you can only avoid *foreclosing* them.
+Durability comes from keeping the model a **re-derivable projection over a
+faithful substrate**, so being wrong about the model is a re-projection, not a
+migration. So we freeze the smallest, most physical core and keep both ends
+fluid — a bowtie:
+
+```
+     fan-in (fluid)              KNOT (frozen, minimal)          fan-out (fluid)
+ ┌──────────────────┐    ┌──────────────────────────────┐   ┌──────────────────┐
+ BACnet scan/pull ──┐    │ 1. FAITHFUL TESTIMONY         │   ┌── classification
+ Excel / docs / jpg ┼──▶ │    immutable log of fragments │──▶│── equipment/plant
+ InfluxDB / MQTT  ──┘    │    over surrogate handles     │   ┌── chat/dashboards
+ new source types ──     │ 2. LAWFUL RATIFICATION        │   └── apps / alerts
+                         │    the one path data→belief   │
+ add sources freely      └──────────────────────────────┘   add models/apps freely
+```
+
+Over-freezing the *ontology* (modelling everything "properly" up front) is the
+failure mode — it widens the knot until the system can't evolve. Freeze the
+substrate and identity; leave the model soft. (This is the same instinct as
+[Immutable raw data](#immutable-raw-data) and [Schema on read](#schema-on-read),
+stated as a frozen/fluid boundary.)
+
+### Knot 1 — faithful testimony (the event log)
+
+The substrate is an **immutable, append-only log of fragments**. A fragment is a
+provenanced assertion:
+
+> *source S, at coordinate C, at time T, asserts X.*
+
+- **Immutable**: a different assertion is a different fragment. Corrections are
+  new fragments that *supersede* prior ones — never edits, never deletes.
+- **Two coarse kinds, no ontological exception**: *observations* (raw receipts)
+  and *interpretations* (understanding). Both are claims (see ratification).
+- **Thin frozen envelope, open payload**: the envelope carries provenance +
+  identity-peg + a **scheme tag** + status; the payload is open — a typed tuple
+  for a value, natural language for a fuzzy claim, a subject-predicate-object for
+  a relation. Consumers dispatch on the scheme tag (like `Content-Type`). Freeze
+  the meta-protocol, not the dialects.
+- **Modality-neutral**: a BACnet read, a spreadsheet row, a screenshot
+  annotation, and a doc claim are all fragments. BACnet is simply the most
+  *physical* attestor, not the definition.
+
+**Fidelity is the axiom — but it is fidelity of *testimony*, not of *truth*.**
+The log guarantees a faithful, tamper-evident record of *what each channel
+asserted it delivered*. It does **not** guarantee correspondence to reality — a
+stuck sensor's lie is recorded just as faithfully. Everything else is conditional
+on the log's fidelity, so the log must be: append-only, durable, faithful at
+capture (no interpretation baked in at ingest), **provenance-authenticated**
+(self-certification is only as strong as the provenance's integrity),
+consistently ordered, **gap-honest** (records what the beam did *not* capture, so
+absence-of-event is never read as absence-in-reality), and tamper-evident. It is
+the one thing with no higher source to rebuild it from — the genome, and the
+single point of catastrophic (silent) failure. Guard it with paranoia; spend the
+intelligence budget above it. **Truth is not in the log — it is built on top of
+testimony by ratification.**
+
+### Knot 2 — ratification (the one path to belief)
+
+A single, uniform, content- and source-agnostic gate turns testimony into
+believed knowledge: **propose → review → ratify**, carrying provenance.
+
+- **Only currently-ratified claims base authoritative answers.** Unratified
+  claims are not invisible — they surface as *hypotheses / visible gaps*, and a
+  query that hits one can *trigger* its ratification. This is the write side of
+  the [Core Loop](#core-loop--query-driven-resolution): the query pulls
+  understanding toward ratification.
+- **Observations are not exempt.** Sensors drift, stick, and conflict; *believing*
+  a reading is itself ratification — just under a cheap policy. The gate has a
+  **policy spectrum, not a fork**: `auto` (validity checks, conflict/fusion
+  rules) → `batch` → `human review`. Data quality (range, stuck-sensor,
+  wire-beats-file fusion) lives in the auto-ratify policy; per-source trust can be
+  learned. Retraction is symmetric — un-ratify a faulty sensor's window without
+  touching history.
+- **Generation ≠ ratification.** *Generating* a proposed interpretation (the LLM
+  reasoning over evidence) is fluid — many reasoners, plural, evolvable, never
+  frozen. *Committing* it is the knot. Many ways to propose; one lawful way to
+  believe.
+- Ratifications are themselves fragments written back into the log. So **knot 1 is
+  the state, knot 2 is the lawful transition over it** — two faces of one
+  contract (like DNA + replication-with-fidelity).
+
+### Identity — coordinates, surrogates, channels
+
+Two identities that must not be conflated:
+
+- **Observation coordinate** — *where* a fragment was captured, handed to you for
+  free by the channel. `<channel>:device:object_type:object_instance` for wire,
+  `<file-sha>:region` for a document. Physical, immediate.
+- **Semantic identity** — *what* it is about. This is an emergent, revisable
+  **link** (mention → entity) built by ratification; often absent, tentative, or
+  plural at capture. A screenshot's "AHU-1" is a *mention*, not an identity.
+
+On the wire these nearly coincide (BACnet hands you a clean physical address);
+documents pull them apart, which is why a doc contributes *evidence fragments*
+(some resolving to points, some feeding higher knowledge), not "a RawTag".
+
+Identity keying follows classic surrogate-vs-natural-key discipline:
+
+- **Immutable artifacts** (files, individual readings, events) are
+  content/natural-keyed — a file *is* its `sha256` (a necessity-knot: id equals
+  content, unique by construction).
+- **Persistent entities** (points, equipment, channels, buildings) get **opaque
+  surrogate keys**; coordinates, hashes, and signatures are *natural keys for
+  matching*, never the PK. A BACnet renumber or an edge swap updates a
+  coordinate→surrogate mapping while the surrogate — and every FK (readings,
+  classifications, links) — stays put.
+- **Channel, not building, gives uniqueness.** A BACnet address is unique only
+  within its internetwork, so the namespace is the *observation channel* (a
+  physical network/edge/broker), not an organizational label. `tenant` and
+  `building` become revisable *links above* the coordinate — which turns the
+  building-rename migration (paid once) into a one-row edit.
+- **The edge is the instrument, not the channel.** A spoiled edge is *re-bound* to
+  the same logical channel — verified through ratification (does the replacement
+  see the same device population/signatures?) — with zero coordinate churn. Live
+  channels are convention-knots (stable by discipline, guarded in a small
+  registry); only content-addressed artifacts get a true necessity-knot.
+
+### Entities are projections, not records
+
+An entity has almost no content of its own. It is a minted **surrogate** plus the
+**fold over every fragment that references it**, from its *birth* event to its
+*death/merge* event.
+
+```
+fragments (immutable testimony)              entity = surrogate + projection
+  F1: coord C1 observed V @ T      ─┐
+  F2: "screenshot: valve on X"     ─┼─resolve─▶  e7f3   (opaque handle)
+  F3: "C1 is return-temp"     [✓]  ─┤              │  fold over F1..Fn (ratified)
+  F4: "e7f3 named AHU_1"      [✓]  ─┘              ▼
+                                        cache: {name:AHU_1, type:AHU,
+                                          status:approved}   ← rebuildable
+```
+
+- Existence is a *ratifiable* property: the surrogate exists when minted; the
+  *entity* exists iff a ratified existence-claim references it. This is what lets
+  the system be wrong about an entity (a hallucinated AHU, a duplicate, a
+  conflation) and recover by retracting or **merging claims** — new events, never
+  history rewrites. Death = removal from the live projection, not deletion.
+- Apparent mutability is an illusion over an immutable log — like a bank balance
+  over transactions, or a git branch over commits.
+- The graph's Entity nodes (materialized `name`/`type`/`status`) are **caches** —
+  the model is a memoization layer, consistent with the
+  [Core Loop](#core-loop--query-driven-resolution).
+
+### Logs vs projections — where time lives
+
+The graph has no time dimension, and that is correct: **the graph is a
+projection, and projections are snapshots — time lives in the log, not the
+read-model.** So the tail's history does not go *into* the graph; it lives in a
+time-ordered **claims log** that sits beside `readings`:
+
+```
+LOGS (append-only, timestamped, authoritative)     PROJECTIONS (current, rebuildable)
+  readings   — numeric observations       ──┐
+  claims log — interpretations,             ├── fold ─▶  AGE graph (traversal,
+               ratifications, merges,       │            current belief)
+               retractions; each asserted_at┘            views  — no time, by design
+```
+
+Both the numeric head (`readings`) and the structural tail (the claims log) are
+time-ordered append-only logs; the **graph is a second projection** over the
+tail's log, for the queries a flat log is bad at (traversal, "current belief
+about E"). The graph's timelessness is not a gap — it is what a current-state
+projection *is*. History and "as-of T" live in the log.
+
+Two ways to answer historical questions, chosen by demand:
+
+- **Log + on-demand replay (default):** keep the graph a timeless *current*
+  snapshot; answer "as-of T" by projecting the claims log at T into a temporary
+  view. No temporal bookkeeping in the hot graph.
+- **Bitemporal graph (only when historical *traversal* is demanded):** carry
+  `asserted_at`/`retracted_at`/`superseded_by` on nodes and edges, never delete,
+  and filter every query to validity. Viable but heavier — AGE has no native
+  temporal support, so it is convention-in-properties: easy to read stale if a
+  filter is forgotten, and grows monotonically. This is the
+  [no-bitemporality](#v1-graph-current-topology-no-bitemporality) item; add it
+  per demand (Core Loop), not speculatively.
+
+**The claims log is not a new store — it is the belief-bearing subset of the
+[unified event log](#unified-events)** (see there).
+
+### Current implementation vs target
+
+Honest status — this section is the conceptual foundation; the running system
+approximates it and collapses parts of it for now:
+
+- The conceptual log is today **materialized across three stores**: `readings`
+  (observation fragments), the AGE graph (entities + classifications, whose
+  `status` is a crude materialized projection), and [`evoiot.events`](#unified-events)
+  (provenance/audit). These are projections of the one conceptual log, not a
+  literal single event-sourced store.
+- `rawtag_id` currently embeds `tenant:building:device:object_type:object_instance`.
+  The **channel-scoped coordinate + surrogate key + link-based tenant/building**
+  is the target (it removes the migration cliff already paid once on a building
+  rename).
+- `propose → review → ratify` exists for classification and equipment discovery;
+  extending it *uniformly* — including auto-ratified observations and
+  resolution/binding decisions — is the direction.
+- Full event-sourcing / bitemporality is a direction (see
+  [v1 graph — no bitemporality](#v1-graph-current-topology-no-bitemporality)).
+
+---
+
 ## Core Philosophy
 
 ### Immutable raw data
@@ -1013,7 +1226,35 @@ Filter by data_id            → data provenance   (for customers)
 Filter by actor              → audit trail       (for compliance)
 ```
 
-One event stream, one table, different query patterns. Design for the strictest requirements (audit: append-only, 100% capture, long retention) and the others come for free.
+One event stream, one table, different query patterns. Design for the strictest requirement — now **claims** (the log is the source of truth for belief), stricter even than audit — and the rest come for free.
+
+There is a fourth, strongest reading of the same stream: **claims**. The
+belief-bearing events — those with a `data_id` and an assertion/ratification
+`operation` (`llm_classify`, `human_approve`, `resolve`, `merge`, `retract`) —
+*are* the authoritative **claims log**: `llm_classify` is a proposed
+interpretation, `human_approve` a ratification. So the claims log and this event
+log are **not two things to unify — they are already one**; the claim lifecycle
+is already recorded here, today, as audit. Making it authoritative is a change of
+**role, not schema**: treat the belief-bearing subset as the source of truth and
+derive the [graph as a projection](#logs-vs-projections--where-time-lives) over
+it, instead of keeping a parallel *mutable* store of belief in the graph. Two
+consequences:
+
+- **Schema enrichment (small):** a belief-bearing event must carry enough to fold
+  — subject (`data_id`), predicate/object and `status` (in `payload` or dedicated
+  columns), and a `supersedes` link. Folding the latest ratified claim per
+  (subject, predicate) *is* the graph projection.
+- **Criticality upgrade:** an audit shadow you could afford to lose becomes the
+  genome. Once belief is projected from it, the event log inherits the full
+  fidelity demands of [knot 1](#knot-1--faithful-testimony-the-event-log)
+  (durability, tamper-evidence, backup) — losing it now loses all belief, not
+  just the audit trail.
+
+So do **not** add a separate claims table: the claims log is the belief-bearing
+subset of this one event log. (The numeric head stays in `readings` for
+[physics reasons](#logs-vs-projections--where-time-lives) — `readings` and this
+event log are the two physical logs, unified conceptually. The containment
+`logging ⊂ provenance ⊂ audit` gains a strongest tier: `⊂ claims / belief`.)
 
 ```
 Logging  ⊂  Provenance  ⊂  Audit
