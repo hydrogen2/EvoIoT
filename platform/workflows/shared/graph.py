@@ -228,11 +228,64 @@ def get_device_types() -> list[dict]:
 # path (projector.rebuild_graph_from_claims) go through them, so a single claim
 # and a full replay produce identical graph state.
 
+def _mint_bms_id() -> str:
+    """A fresh opaque BMS surrogate. The BMS is the physical observation channel
+    (one BACnet internetwork); a device:object address is unique only within it,
+    so the BMS — not the organizational 'building' — is what scopes a rawtag."""
+    return "bms_" + uuid.uuid4().hex[:12]
+
+
+def resolve_bms(tenant_id: str, building: str, edge: str | None = None) -> str:
+    """Resolve (or mint) the BMS surrogate for a (tenant, building). building is
+    an attribute of the BMS, not part of any identity."""
+    b = _sanitize_cypher_string(building)
+    rows = execute_cypher(
+        f"MATCH (m:BMS {{tenant_id: '{tenant_id}', building: '{b}'}}) RETURN m.id")
+    if rows:
+        v = rows[0]
+        return v if isinstance(v, str) else str(v).strip('"')
+    bms_id = _mint_bms_id()
+    append_claim(bms_id, "bms_exists", building, "approved",
+                 payload={"tenant_id": tenant_id, "building": building, "edge": edge})
+    _project_bms(bms_id, tenant_id, building, edge)
+    return bms_id
+
+
+def _project_bms(bms_id: str, tenant_id: str, building: str, edge: str | None = None) -> None:
+    b = _sanitize_cypher_string(building)
+    e = _sanitize_cypher_string(edge or "")
+    execute_cypher(f"MERGE (m:BMS {{id: '{bms_id}'}}) RETURN m")
+    execute_cypher(f"MATCH (m:BMS {{id: '{bms_id}'}}) "
+                   f"SET m.tenant_id = '{tenant_id}', m.building = '{b}', m.edge = '{e}' RETURN m")
+
+
+def assert_file_export_of_bms(sha256: str, bms_id: str, actor: str = "extraction") -> None:
+    """Explicit claim that a catalogued file IS the export of a BMS — replacing
+    the folder-convention *implication*. Both the file's points and the wire's
+    resolve to the same bms:device:object coordinate and merge."""
+    append_claim(sha256, "is_export_of", bms_id, "approved", actor=actor)
+
+
+def rawtag_coordinate(bms_id: str, device_id: str, object_type: str, object_instance: str) -> str:
+    """BMS-scoped rawtag coordinate: bms:device:object_type:object_instance.
+    All datasources of one BMS report the same coordinate for the same point,
+    so multi-source observations merge with no per-reading resolution."""
+    return f"{bms_id}:{device_id}:{object_type}:{object_instance}"
+
+
 def building_of(rawtag_id: str) -> str:
-    """Building segment of a rawtag coordinate (tenant:building:device:...).
-    Equipment don't span buildings, so a member's building scopes the equipment."""
-    parts = (rawtag_id or "").split(":")
-    return parts[1] if len(parts) > 2 else ""
+    """Building of a rawtag, via its BMS. The coordinate is bms:device:object;
+    building is an attribute of the BMS, looked up (not parsed from the id)."""
+    bms_id = (rawtag_id or "").split(":")[0]
+    if not bms_id.startswith("bms_"):
+        # legacy tenant:building:device:... coordinate
+        parts = (rawtag_id or "").split(":")
+        return parts[1] if len(parts) > 2 else ""
+    rows = execute_cypher(f"MATCH (m:BMS {{id: '{bms_id}'}}) RETURN m.building")
+    if rows:
+        v = rows[0]
+        return v if isinstance(v, str) else str(v).strip('"')
+    return ""
 
 
 def _mint_equipment_id() -> str:

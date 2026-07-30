@@ -13,7 +13,7 @@ import os
 import psycopg2
 from restate import Workflow, WorkflowContext
 
-from shared import tabular
+from shared import tabular, graph
 from shared.config import POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD
 from shared.llm import summarize_file, propose_table_mapping
 from shared.traced import traced_run
@@ -85,31 +85,34 @@ def _extract(file: dict, spec: dict) -> dict:
     result = tabular.apply_mapping(sheets, spec)
     claims = result["claims"]
     evidence_base = f"file:{file['sha256'][:12]}#{result['sheet']}"
-    # rawtag_id namespace = the BUILDING, derived from folder position
-    # (HDB/RP/... -> RP). Source is recorded per-tag as origin='file', not in
-    # the identity — so wire-scanned RawTags for the same points fuse here.
+    # The rawtag coordinate is BMS-scoped (bms:device:object). Resolve the BMS
+    # this file's building maps to, and assert the explicit claim that this file
+    # IS that BMS's export — so its points fuse with the wire's on bms:device:
+    # object. building stays a stored attribute, not part of the identity.
     namespace = file["building"] or file["tenant_id"]
+    bms_id = graph.resolve_bms(file["tenant_id"], namespace)
+    graph.assert_file_export_of_bms(file["sha256"], bms_id)
 
     conn = _connect()
     try:
         with conn.cursor() as cur:
             # upsert_rawtag(tenant, building, device, otype, oinst, tag_type,
-            #   origin, evidence, object_name, unit, value_sample, path, ip, port)
+            #   origin, evidence, object_name, unit, value_sample, path, ip, port, bms)
             devices = {}
             for c in claims:
                 devices[c["device_id"]] = c["device_name"]
             for device_id, device_name in devices.items():
                 cur.execute(
-                    "SELECT evoiot.upsert_rawtag(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    "SELECT evoiot.upsert_rawtag(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (file["tenant_id"], namespace, device_id, None, None, "device",
-                     "file", evidence_base, device_name, None, None, None, None, None))
+                     "file", evidence_base, device_name, None, None, None, None, None, bms_id))
             for c in claims:
                 cur.execute(
-                    "SELECT evoiot.upsert_rawtag(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    "SELECT evoiot.upsert_rawtag(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                     (file["tenant_id"], namespace, c["device_id"],
                      c["object_type"], c["object_instance"], "object",
                      "file", f"{evidence_base}!r{c['row']}",
-                     c["object_name"], c["unit"], c["value_sample"], c["path"], None, None))
+                     c["object_name"], c["unit"], c["value_sample"], c["path"], None, None, bms_id))
             cur.execute("UPDATE evoiot.files SET status = 'extracted' WHERE sha256 = %s",
                         (file["sha256"],))
     finally:

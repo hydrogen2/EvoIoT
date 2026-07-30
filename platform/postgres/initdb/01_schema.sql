@@ -603,7 +603,8 @@ CREATE OR REPLACE FUNCTION evoiot.upsert_rawtag(
     p_value_sample TEXT DEFAULT NULL,
     p_path TEXT DEFAULT NULL,
     p_device_ip TEXT DEFAULT NULL,
-    p_device_port TEXT DEFAULT NULL
+    p_device_port TEXT DEFAULT NULL,
+    p_bms TEXT DEFAULT NULL          -- BMS surrogate; when set, scopes the coordinate
 ) RETURNS TEXT AS $$
 DECLARE
     v_id TEXT;
@@ -613,10 +614,12 @@ BEGIN
     EXECUTE 'SET search_path TO ag_catalog, evoiot, public';
 
     IF p_tag_type = 'device' THEN
-        v_id := p_tenant_id || ':' || p_building || ':' || p_device_id;
+        v_id := COALESCE(p_bms || ':' || p_device_id,
+                         p_tenant_id || ':' || p_building || ':' || p_device_id);
     ELSE
-        v_id := p_tenant_id || ':' || p_building || ':' || p_device_id
-            || ':' || COALESCE(p_object_type, '') || ':' || COALESCE(p_object_instance, '');
+        v_id := COALESCE(
+            p_bms || ':' || p_device_id || ':' || COALESCE(p_object_type, '') || ':' || COALESCE(p_object_instance, ''),
+            p_tenant_id || ':' || p_building || ':' || p_device_id || ':' || COALESCE(p_object_type, '') || ':' || COALESCE(p_object_instance, ''));
     END IF;
 
     -- strip quotes/backslashes: cypher's parser inside $cypher$ can't handle them
