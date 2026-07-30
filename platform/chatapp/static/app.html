@@ -1,0 +1,139 @@
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RP Building</title>
+<style>
+:root{--page:#0d0d0d;--surface:#1a1a19;--panel:#171b21;--edge:rgba(255,255,255,.1);--ink:#fff;--ink2:#c3c2b7;--muted:#898781;--acc:#3987e5;--user:#1f6feb}
+*{box-sizing:border-box}
+body{margin:0;height:100vh;display:flex;background:var(--page);color:var(--ink);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;color-scheme:dark}
+
+/* ── left: views ── */
+#side{width:216px;flex:none;border-right:1px solid var(--edge);display:flex;flex-direction:column;background:var(--surface)}
+#side .brand{padding:16px 16px 4px;font-weight:650;font-size:15px}
+#side .sub{padding:0 16px 12px;color:var(--muted);font-size:11.5px;border-bottom:1px solid var(--edge)}
+#side .label{padding:14px 16px 6px;color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.7px}
+#viewlist{flex:1;overflow-y:auto}
+.vitem{padding:8px 16px;cursor:pointer;color:var(--ink2);font-size:13px;border-left:2px solid transparent;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.vitem:hover{color:var(--ink)}
+.vitem.sel{color:var(--ink);border-left-color:var(--acc);background:rgba(57,135,229,.08)}
+.vhint{padding:8px 16px;color:var(--muted);font-size:12px;line-height:1.45}
+#side .foot{padding:10px 16px;border-top:1px solid var(--edge);color:var(--muted);font-size:11.5px}
+
+/* ── center: canvas ── */
+#main{flex:1;min-width:0;display:flex;flex-direction:column}
+#canvas{flex:1;border:0;width:100%;display:none;background:var(--page)}
+#empty{flex:1;display:grid;place-items:center;color:var(--muted);font-size:13.5px;text-align:center;padding:30px;line-height:1.7}
+
+/* ── right: chat ── */
+#chatcol{width:400px;flex:none;border-left:1px solid var(--edge);display:flex;flex-direction:column;background:var(--panel)}
+#chatcol .head{padding:12px 16px;border-bottom:1px solid var(--edge);font-size:12.5px;font-weight:600;color:var(--ink2);display:flex;gap:8px;align-items:baseline}
+#ctx{color:var(--muted);font-weight:400;font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#log{flex:1;overflow-y:auto;padding:16px 14px;display:flex;flex-direction:column;gap:14px}
+.msg{display:flex;gap:9px;align-items:flex-start}
+.msg .who{width:24px;height:24px;border-radius:6px;flex:none;display:grid;place-items:center;font-size:11px;font-weight:700}
+.user .who{background:var(--user);color:#fff}.bot .who{background:#2b333d;color:var(--acc)}
+.msg .body{padding-top:2px;white-space:pre-wrap;min-width:0;font-size:13.5px}
+.meta{color:var(--muted);font-size:11px;margin-top:4px}
+.chips{display:flex;gap:7px;flex-wrap:wrap;margin-top:6px}
+.chip{border:1px solid var(--edge);background:var(--surface);color:var(--muted);padding:4px 10px;border-radius:13px;font-size:12px;cursor:pointer}
+.chip:hover{border-color:var(--acc);color:var(--ink)}
+.openlink{display:inline-block;margin-top:6px;color:var(--acc);text-decoration:none;border:1px solid var(--edge);border-radius:13px;padding:4px 11px;font-size:12.5px;cursor:pointer}
+footer{border-top:1px solid var(--edge);padding:10px 12px}
+.inwrap{display:flex;gap:8px}
+textarea{flex:1;resize:none;background:var(--page);border:1px solid var(--edge);color:var(--ink);border-radius:9px;padding:9px 11px;font:inherit;font-size:13.5px;max-height:120px}
+textarea:focus{outline:none;border-color:var(--acc)}
+button{background:var(--acc);border:0;color:#fff;border-radius:9px;padding:0 15px;font-weight:600;cursor:pointer;font:inherit}
+button:disabled{opacity:.5}
+.dots{color:var(--muted)}
+
+@media(max-width:960px){
+  body{flex-direction:column;height:auto;min-height:100vh}
+  #side{width:100%;flex-direction:row;align-items:center;border-right:0;border-bottom:1px solid var(--edge);overflow-x:auto}
+  #side .brand{padding:10px 12px;white-space:nowrap}
+  #side .sub,#side .label,#side .foot,.vhint{display:none}
+  #viewlist{display:flex;flex:1}
+  .vitem{border-left:0;border-bottom:2px solid transparent}
+  .vitem.sel{border-bottom-color:var(--acc)}
+  #main{min-height:46vh}
+  #chatcol{width:100%;flex:1;border-left:0;border-top:1px solid var(--edge)}
+}
+</style></head><body>
+
+<nav id="side">
+  <div class="brand">RP Building</div>
+  <div class="sub" id="livestat">connecting…</div>
+  <div class="label">Apps</div>
+  <div id="viewlist"></div>
+  <div class="vhint" id="vhint">No apps yet — ask the chat to pin one, e.g. "pin a dashboard of plant power and alarms".</div>
+  <div class="foot">views are specs — regenerable, iterated in chat</div>
+</nav>
+
+<div id="main">
+  <iframe id="canvas" title="view"></iframe>
+  <div id="empty">Pick an app on the left, or ask the chat for one.<br>
+  Anything pinned lands in the sidebar; keep talking to refine what's on screen.</div>
+</div>
+
+<div id="chatcol">
+  <div class="head">Chat <span id="ctx"></span></div>
+  <div id="log"></div>
+  <footer><div class="inwrap">
+    <textarea id="in" rows="1" placeholder="Ask about conditions, or build/refine the open app…"></textarea>
+    <button id="send">Send</button>
+  </div></footer>
+</div>
+
+<script>
+const log=document.getElementById('log'),input=document.getElementById('in'),send=document.getElementById('send');
+const canvas=document.getElementById('canvas'),empty=document.getElementById('empty'),ctx=document.getElementById('ctx');
+let history=[],currentView=null,views=[];
+
+function bubble(role,txt){const m=document.createElement('div');m.className='msg '+(role==='user'?'user':'bot');
+ m.innerHTML='<div class=who>'+(role==='user'?'you':'RP')+'</div><div class=body></div>';
+ m.querySelector('.body').textContent=txt;log.appendChild(m);log.scrollTop=log.scrollHeight;return m.querySelector('.body');}
+function meta(el,t){const d=document.createElement('div');d.className='meta';d.textContent=t;el.parentNode.appendChild(d);}
+
+function selectView(name){
+ currentView=name;
+ document.querySelectorAll('.vitem').forEach(e=>e.classList.toggle('sel',e.dataset.name===name));
+ if(name){canvas.src='/view/'+encodeURIComponent(name);canvas.style.display='block';empty.style.display='none';
+  ctx.textContent='· viewing '+name;}
+ else{canvas.style.display='none';empty.style.display='grid';ctx.textContent='';}
+}
+function reloadOpenView(){if(currentView)canvas.src='/view/'+encodeURIComponent(currentView);}
+
+async function loadViews(sel){
+ const j=await(await fetch('/api/views')).json();views=j.views;
+ const list=document.getElementById('viewlist');list.innerHTML='';
+ document.getElementById('vhint').style.display=views.length?'none':'block';
+ views.forEach(v=>{const d=document.createElement('div');d.className='vitem';d.dataset.name=v.name;
+  d.textContent=v.title||v.name;d.title=(v.description||'');d.onclick=()=>selectView(v.name);list.appendChild(d);});
+ if(sel)selectView(sel);else if(currentView)selectView(currentView);
+}
+
+async function greet(){try{const b=await(await fetch('/building')).json();
+ document.getElementById('livestat').textContent=b.live_points+' live points';
+ const el=bubble('bot',"I'm the "+b.building+" building agent — "+b.equipment.map(e=>e[1]+' '+e[0]+(e[1]>1?'s':'')).join(', ')+", "+b.live_points+" points live. Ask about conditions, or ask me to pin a dashboard; with an app open, tell me how to change it.");
+ const c=document.createElement('div');c.className='chips';
+ ['What are the chiller temperatures?','Any alarms or trips?','Pin me a dashboard of plant power and temps'].forEach(q=>{const s=document.createElement('div');s.className='chip';s.textContent=q;s.onclick=()=>{input.value=q;go();};c.appendChild(s);});
+ el.parentNode.appendChild(c);
+}catch(e){document.getElementById('livestat').textContent='offline';}}
+
+async function go(){const q=input.value.trim();if(!q)return;input.value='';input.style.height='auto';send.disabled=true;
+ bubble('user',q);history.push({role:'user',content:q});
+ const el=bubble('bot','');el.innerHTML='<span class=dots>working…</span>';
+ try{const r=await(await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify({message:q,history:history.slice(0,-1),view:currentView})})).json();
+  if(r.error){el.textContent='⚠ '+r.error;}
+  else{el.textContent=r.answer;history.push({role:'assistant',content:r.answer});
+   meta(el,(r.tools&&r.tools.length?r.tools.join(' · ')+' · ':'')+r.elapsed+'s');
+   if(r.published){await loadViews(r.published);reloadOpenView();
+    const a=document.createElement('span');a.className='openlink';a.textContent='⊞ '+r.published+' updated';
+    a.onclick=()=>selectView(r.published);el.parentNode.appendChild(a);}}}
+ catch(e){el.textContent='⚠ '+e;}
+ send.disabled=false;input.focus();}
+
+send.onclick=go;
+input.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();go();}});
+input.addEventListener('input',()=>{input.style.height='auto';input.style.height=input.scrollHeight+'px';});
+greet();loadViews();
+</script></body></html>

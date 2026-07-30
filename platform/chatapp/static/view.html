@@ -1,0 +1,180 @@
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>View</title>
+<style>
+:root{--page:#0d0d0d;--surface:#1a1a19;--ink:#fff;--ink2:#c3c2b7;--muted:#898781;--edge:rgba(255,255,255,.1);--acc:#3987e5}
+*{box-sizing:border-box}
+body{margin:0;background:var(--page);color:var(--ink);font:14px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;color-scheme:dark}
+header{display:flex;align-items:baseline;gap:14px;padding:16px 22px;border-bottom:1px solid var(--edge);flex-wrap:wrap}
+header h1{margin:0;font-size:17px;font-weight:650}
+header .desc{color:var(--muted);font-size:13px;flex:1;min-width:200px}
+header a{color:var(--acc);text-decoration:none;font-size:13px}
+#stale{color:var(--muted);font-size:12px}
+#grid{display:grid;grid-template-columns:repeat(12,1fr);gap:14px;padding:18px 22px;max-width:1280px;margin:0 auto}
+.block{background:var(--surface);border:1px solid var(--edge);border-radius:12px;padding:14px 16px;min-width:0}
+.block h2{margin:0 0 10px;font-size:12.5px;font-weight:600;color:var(--ink2);text-transform:uppercase;letter-spacing:.5px}
+.err{color:#e66767;font-size:12.5px}
+@media(max-width:900px){#grid>.block{grid-column:1/-1 !important}}
+</style></head><body>
+<header>
+  <h1 id="title">…</h1><span class="desc" id="desc"></span>
+  <span id="stale"></span>
+  <a href="/">⌂ home</a>
+</header>
+<div id="grid"></div>
+<script src="/static/components.js"></script>
+<script>
+/* embedded in the app page's canvas: the page provides the chrome */
+if (window.self !== window.top) document.querySelector('header').style.display = 'none';
+const name = decodeURIComponent(location.pathname.split('/').pop());
+let spec = null, lastOk = null;
+
+async function loadSpec() {
+  const r = await fetch('/api/view/' + encodeURIComponent(name));
+  if (!r.ok) { document.getElementById('title').textContent = 'view not found'; throw new Error(); }
+  spec = await r.json();
+  document.title = spec.title;
+  document.getElementById('title').textContent = spec.title;
+  document.getElementById('desc').textContent = spec.description || '';
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+  spec.blocks.forEach((b, i) => {
+    const d = document.createElement('div');
+    d.className = 'block';
+    d.style.gridColumn = `span ${b.width || defaultWidth(b.component)}`;
+    if (b.title) { const h = document.createElement('h2'); h.textContent = b.title; d.appendChild(h); }
+    const mount = document.createElement('div'); mount.id = 'mount-' + i; d.appendChild(mount);
+    grid.appendChild(d);
+  });
+}
+function defaultWidth(c){ return {stat:3,trend:6,bars:6,table:6,alarms:6,note:12}[c] || 6; }
+
+/* ── custom components: private library overlay, rendered sandboxed ──
+   Code runs in a null-origin iframe (sandbox="allow-scripts"): no cookies, no
+   same-origin API access. The parent feeds it its block's live data on every
+   refresh and mediates interactive reads via the query bridge, so a bad
+   generation can only garble its own box. */
+const customFrames = {}, customDefs = {};
+
+function sandboxDoc(code) {
+  const esc = code.replace(/<\/script/gi, '<\\/script');
+  const S = '</scr' + 'ipt>';
+  return '<!doctype html><html><head><meta charset="utf-8"><style>' +
+    'body{margin:0;background:transparent;color:#fff;font:13.5px system-ui,-apple-system,"Segoe UI",sans-serif;color-scheme:dark}' +
+    '</style></head><body><div id="root"></div>' +
+    '<script src="' + location.origin + '/static/components.js">' + S +
+    '<script>' + esc + S +
+    '<script>' +
+    'let seq=0;const pend={};' +
+    'window.queryData=(fn,args)=>new Promise((res,rej)=>{const id=++seq;pend[id]={res,rej};parent.postMessage({type:"query",id,fn,args:args||{}},"*")});' +
+    'window.addEventListener("message",e=>{const m=e.data||{};' +
+    'if(m.type==="data"){try{render(document.getElementById("root"),m.data,m.props||{});}' +
+    'catch(err){parent.postMessage({type:"render_error",msg:String(err&&err.message||err)},"*");}' +
+    'requestAnimationFrame(()=>parent.postMessage({type:"resize",h:Math.max(document.documentElement.scrollHeight,document.body.scrollHeight)},"*"));}' +
+    'if(m.type==="result"&&pend[m.id]){m.error?pend[m.id].rej(new Error(m.error)):pend[m.id].res(m.data);delete pend[m.id];}});' +
+    'parent.postMessage({type:"ready"},"*");' + S +
+    '</body></html>';
+}
+
+window.addEventListener('message', async e => {
+  const m = e.data || {};
+  const ent = Object.entries(customFrames).find(([, f]) => f.iframe.contentWindow === e.source);
+  if (!ent) return;
+  const [i, fr] = ent;
+  if (m.type === 'ready') {
+    fr.ready = true;
+    if (fr.queue) fr.iframe.contentWindow.postMessage({ type: 'data', ...fr.queue }, '*');
+  } else if (m.type === 'resize' && m.h) {
+    fr.iframe.style.height = Math.min(Math.max(m.h + 4, 60), 720) + 'px';
+  } else if (m.type === 'query') {
+    try {
+      const r = await fetch('/api/data', { method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ fn: m.fn, args: m.args || {}, building: spec.building }) });
+      const j = await r.json();
+      e.source.postMessage({ type: 'result', id: m.id, data: j.error ? undefined : j, error: j.error }, '*');
+    } catch (err) {
+      e.source.postMessage({ type: 'result', id: m.id, error: String(err) }, '*');
+    }
+  } else if (m.type === 'render_error') {
+    // broken custom code: fall back to its declared prototype with the same data
+    const mount = document.getElementById('mount-' + i);
+    mount.innerHTML = '';
+    delete customFrames[i];
+    const proto = fr.def.prototype;
+    if (proto && Components[proto] && fr.queue) {
+      Components[proto](mount, fr.queue.data, fr.queue.props);
+      const d = document.createElement('div');
+      d.style.cssText = 'color:#c98500;font-size:11px;margin-top:5px';
+      d.textContent = '◈ custom component errored ("' + (m.msg || '').slice(0, 120) + '") — showing base ' + proto;
+      mount.appendChild(d);
+    } else {
+      const d = document.createElement('div'); d.className = 'err';
+      d.textContent = '⚠ custom component error: ' + (m.msg || 'unknown'); mount.appendChild(d);
+    }
+  }
+});
+
+async function renderCustom(b, i, data) {
+  const mount = document.getElementById('mount-' + i);
+  let fr = customFrames[i];
+  if (!fr) {
+    if (customDefs[b.component] === undefined) {
+      const r = await fetch('/api/component/' + encodeURIComponent(b.component));
+      customDefs[b.component] = r.ok ? await r.json() : null;
+    }
+    const def = customDefs[b.component];
+    if (!def) throw new Error('custom component "' + b.component + '" not found (deleted?)');
+    mount.innerHTML = '';
+    const iframe = document.createElement('iframe');
+    iframe.setAttribute('sandbox', 'allow-scripts');
+    iframe.style.cssText = 'width:100%;border:0;height:120px;display:block';
+    iframe.srcdoc = sandboxDoc(def.code);
+    mount.appendChild(iframe);
+    const badge = document.createElement('div');
+    badge.style.cssText = 'color:#898781;font-size:10.5px;margin-top:4px';
+    badge.textContent = '◈ custom' + (def.prototype ? ' · wraps ' + def.prototype : '');
+    mount.appendChild(badge);
+    fr = customFrames[i] = { iframe, ready: false, queue: null, def };
+  }
+  fr.queue = { data, props: b.props || {} };
+  if (fr.ready) fr.iframe.contentWindow.postMessage({ type: 'data', ...fr.queue }, '*');
+}
+
+async function renderBlock(b, i) {
+  const mount = document.getElementById('mount-' + i);
+  try {
+    let data = {};
+    if (b.query) {
+      const r = await fetch('/api/data', { method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ fn: b.query.fn, args: b.query.args || {}, building: spec.building }) });
+      const j = await r.json();
+      if (j.error) throw new Error(j.error);
+      data = j;
+    }
+    if (Components[b.component]) {
+      mount.innerHTML = '';
+      Components[b.component](mount, data, b.props || {});
+    } else {
+      await renderCustom(b, i, data);
+    }
+  } catch (e) {
+    mount.innerHTML = '';
+    const d = document.createElement('div'); d.className = 'err';
+    d.textContent = '⚠ ' + e.message; mount.appendChild(d);
+  }
+}
+
+async function refresh() {
+  await Promise.all(spec.blocks.map(renderBlock));
+  lastOk = Date.now();
+}
+setInterval(() => {
+  if (lastOk) document.getElementById('stale').textContent =
+    'updated ' + Math.round((Date.now() - lastOk) / 1000) + 's ago';
+}, 5000);
+
+loadSpec().then(() => {
+  refresh();
+  setInterval(refresh, Math.max(15, spec.refresh_s || 60) * 1000);
+});
+</script></body></html>
