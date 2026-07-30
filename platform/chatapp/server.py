@@ -14,8 +14,13 @@ import os
 import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import psycopg2
+
+import appdev as appdev_mod
+import functions
+import viewspec
 
 PORT = int(os.environ.get("RP_CHAT_PORT", "8899"))
 MODEL = os.environ.get("RP_CHAT_MODEL", "sonnet")
@@ -26,6 +31,13 @@ DSN = os.environ.get("RP_CHAT_DSN", "host=postgres port=5432 dbname=postgres use
 # service — a container can't run the claude CLI directly.
 LLM_API_BASE = os.environ.get("LLM_API_BASE", "http://host.docker.internal:8787/v1")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+APPDEV_MODEL = os.environ.get("APPDEV_MODEL", MODEL)
+
+STATIC_DIR = Path(__file__).parent / "static"
+
+functions.init(DSN)
+APPDEV = appdev_mod.AppDev(LLM_API_BASE, LLM_API_KEY, APPDEV_MODEL,
+                           DSN, TENANT, BUILDING)
 
 
 def _conn():
@@ -44,7 +56,7 @@ def snapshot():
             cur.execute("SET search_path = ag_catalog, evoiot, public")
             cur.execute(f"""
                 SELECT rid, nm, otype, eq FROM (SELECT * FROM cypher('platform', $$
-                    MATCH (r:RawTag {{tenant_id:'{TENANT}', tag_type:'object'}})
+                    MATCH (r:RawTag {{tenant_id:'{TENANT}', building:'{BUILDING}', tag_type:'object'}})
                     OPTIONAL MATCH (r)-[:BELONGS_TO]->(e:Equipment)
                     RETURN r.id, r.object_name, r.object_type, e.name
                 $$) AS (rid agtype, nm agtype, otype agtype, eq agtype)) s
@@ -82,7 +94,7 @@ def equipment_summary():
             cur.execute("SET search_path = ag_catalog, evoiot, public")
             cur.execute(f"""
                 SELECT dtype, n FROM (SELECT * FROM cypher('platform', $$
-                    MATCH (e:Equipment {{tenant_id:'{TENANT}'}})-[:IS_TYPE_OF]->(d:DeviceType)
+                    MATCH (e:Equipment {{tenant_id:'{TENANT}', building:'{BUILDING}'}})-[:IS_TYPE_OF]->(d:DeviceType)
                     RETURN d.label, count(e)
                 $$) AS (dtype agtype, n agtype)) s
             """)
@@ -148,6 +160,12 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def _static(self, fname, ctype):
+        f = (STATIC_DIR / fname).resolve()
+        if not f.is_file() or STATIC_DIR.resolve() not in f.parents:
+            return self._send(404, "{}")
+        self._send(200, f.read_bytes(), ctype)
+
     def do_GET(self):
         if self.path == "/":
             self._send(200, HTML, "text/html; charset=utf-8")
@@ -155,19 +173,51 @@ class H(BaseHTTPRequestHandler):
             eq = equipment_summary()
             live = len(snapshot())
             self._send(200, json.dumps({"building": BUILDING, "equipment": eq, "live_points": live}))
+        elif self.path == "/views":
+            self._static("views.html", "text/html; charset=utf-8")
+        elif self.path.startswith("/view/"):
+            self._static("view.html", "text/html; charset=utf-8")
+        elif self.path.startswith("/static/"):
+            ctype = ("application/javascript" if self.path.endswith(".js")
+                     else "text/html; charset=utf-8")
+            self._static(self.path[len("/static/"):], ctype)
+        elif self.path == "/api/views":
+            self._send(200, json.dumps({"views": APPDEV.list_views()}))
+        elif self.path.startswith("/api/view/"):
+            spec = APPDEV.get_view(self.path[len("/api/view/"):])
+            if spec is None:
+                return self._send(404, json.dumps({"error": "no such view"}))
+            self._send(200, json.dumps(spec))
         else:
             self._send(404, "{}")
 
     def do_POST(self):
-        if self.path != "/chat":
-            return self._send(404, "{}")
         try:
             n = int(self.headers.get("Content-Length", "0"))
-            req = json.loads(self.rfile.read(n))
-            t0 = time.time()
-            answer, npts = ask(req.get("message", ""), req.get("history"))
-            self._send(200, json.dumps({"answer": answer, "points_seen": npts,
-                                        "elapsed": round(time.time() - t0, 1)}))
+            req = json.loads(self.rfile.read(n)) if n else {}
+            if self.path == "/chat":
+                t0 = time.time()
+                answer, npts = ask(req.get("message", ""), req.get("history"))
+                self._send(200, json.dumps({"answer": answer, "points_seen": npts,
+                                            "elapsed": round(time.time() - t0, 1)}))
+            elif self.path == "/api/data":
+                result = functions.call(req.get("fn", ""), req.get("args") or {},
+                                        TENANT, req.get("building") or BUILDING)
+                self._send(200, json.dumps(result, default=str))
+            elif self.path == "/api/action":
+                result = functions.call_action(req.get("fn", ""), req.get("args") or {},
+                                               TENANT, req.get("building") or BUILDING)
+                self._send(200, json.dumps(result, default=str))
+            elif self.path == "/api/appdev":
+                try:
+                    result = APPDEV.generate(req.get("request", ""))
+                    self._send(200, json.dumps(result))
+                except ValueError as e:
+                    self._send(422, json.dumps({
+                        "error": str(e),
+                        "validation_errors": getattr(e, "validation_errors", [])}))
+            else:
+                self._send(404, "{}")
         except Exception as e:
             self._send(500, json.dumps({"error": str(e)[:500]}))
 
@@ -196,7 +246,7 @@ button{background:var(--acc);border:0;color:#fff;border-radius:9px;padding:0 18p
 button:disabled{opacity:.5}
 .dots{color:var(--dim)}
 </style></head><body>
-<header><h1>RP Building</h1><div class=sub id=sub>connecting…</div></header>
+<header style="display:flex;align-items:baseline;gap:14px"><h1>RP Building</h1><div class=sub id=sub style="flex:1;margin-top:0">connecting…</div><a href=/views style="color:var(--acc);text-decoration:none;font-size:13px">apps</a></header>
 <div id=log></div>
 <footer><div class=inwrap>
 <textarea id=in rows=1 placeholder="Ask about current conditions… e.g. what are the chiller temperatures?"></textarea>

@@ -227,17 +227,33 @@ def get_device_types() -> list[dict]:
 # path (projector.rebuild_graph_from_claims) go through them, so a single claim
 # and a full replay produce identical graph state.
 
-def _project_equipment(tenant_id: str, equipment_name: str,
+def building_of(rawtag_id: str) -> str:
+    """Building segment of a rawtag coordinate (tenant:building:device:...).
+    Equipment don't span buildings, so a member's building scopes the equipment."""
+    parts = (rawtag_id or "").split(":")
+    return parts[1] if len(parts) > 2 else ""
+
+
+def equipment_id(tenant_id: str, building: str, equipment_name: str) -> str:
+    """Building-scoped equipment identity: tenant:building:name. Building-scoping
+    is what keeps RP's CH_1 and LP's CH_1 distinct (they collided under
+    tenant:name)."""
+    return f"{tenant_id}:{building}:{equipment_name}"
+
+
+def _project_equipment(tenant_id: str, building: str, equipment_name: str,
                        equipment_type: str, status: str) -> None:
     """Materialize an equipment's existence + type + status from a claim."""
-    equip_id = f"{tenant_id}:{equipment_name}"
+    equip_id = equipment_id(tenant_id, building, equipment_name)
     name = _sanitize_cypher_string(equipment_name)
+    bld = _sanitize_cypher_string(building)
     etype = _sanitize_cypher_string(equipment_type)
     st = _sanitize_cypher_string(status)
     execute_cypher(f"MERGE (e:Equipment {{id: '{equip_id}'}}) RETURN e")
     # SET props separately (AGE MERGE+SET quirk)
     execute_cypher(f"MATCH (e:Equipment {{id: '{equip_id}'}}) "
-                   f"SET e.name = '{name}', e.tenant_id = '{tenant_id}', e.status = '{st}' RETURN e")
+                   f"SET e.name = '{name}', e.tenant_id = '{tenant_id}', "
+                   f"e.building = '{bld}', e.status = '{st}' RETURN e")
     # Replace the type edge (re-typing must not leave a second IS_TYPE_OF)
     execute_cypher(f"MATCH (e:Equipment {{id: '{equip_id}'}})-[t:IS_TYPE_OF]->(:DeviceType) "
                    f"DELETE t RETURN e")
@@ -303,21 +319,22 @@ def create_equipment_and_link(
     is the write-through projection of it."""
     if not equipment_name or not equipment_type:
         return
-    equip_id = f"{tenant_id}:{equipment_name}"
-    payload = {"tenant_id": tenant_id, "equipment_name": equipment_name}
+    building = building_of(rawtag_id)
+    equip_id = equipment_id(tenant_id, building, equipment_name)
+    payload = {"tenant_id": tenant_id, "building": building, "equipment_name": equipment_name}
     _require_claim(append_claim(equip_id, "is_type_of", equipment_type, status, payload=payload),
                    f"{equip_id} is_type_of {equipment_type}")
     _require_claim(append_claim(rawtag_id, "belongs_to", equip_id, status, payload=payload),
                    f"{rawtag_id} belongs_to {equip_id}")
-    _project_equipment(tenant_id, equipment_name, equipment_type, status)
+    _project_equipment(tenant_id, building, equipment_name, equipment_type, status)
     _project_belongs_to(rawtag_id, equip_id)
     print(f"[graph] Linked RawTag {rawtag_id} -> Equipment {equip_id} -> DeviceType {equipment_type}", flush=True)
 
 
-def update_equipment_status(tenant_id: str, equipment_name: str, status: str) -> None:
+def update_equipment_status(tenant_id: str, building: str, equipment_name: str, status: str) -> None:
     """Ratify an equipment (status transition). Claim first, then project."""
-    equip_id = f"{tenant_id}:{equipment_name}"
-    payload = {"tenant_id": tenant_id, "equipment_name": equipment_name}
+    equip_id = equipment_id(tenant_id, building, equipment_name)
+    payload = {"tenant_id": tenant_id, "building": building, "equipment_name": equipment_name}
     _require_claim(append_claim(equip_id, "ratified", status, status, payload=payload),
                    f"{equip_id} ratified {status}")
     if status == "retracted":
@@ -327,10 +344,10 @@ def update_equipment_status(tenant_id: str, equipment_name: str, status: str) ->
     print(f"[graph] Equipment {equip_id} status -> {status}", flush=True)
 
 
-def delete_equipment(tenant_id: str, equipment_name: str) -> None:
+def delete_equipment(tenant_id: str, building: str, equipment_name: str) -> None:
     """Retract an equipment. Recorded as a retraction claim, not an erasure."""
-    equip_id = f"{tenant_id}:{equipment_name}"
-    payload = {"tenant_id": tenant_id, "equipment_name": equipment_name}
+    equip_id = equipment_id(tenant_id, building, equipment_name)
+    payload = {"tenant_id": tenant_id, "building": building, "equipment_name": equipment_name}
     _require_claim(append_claim(equip_id, "ratified", "retracted", "retracted", payload=payload),
                    f"{equip_id} retracted")
     _retract_equipment(equip_id)
@@ -342,12 +359,13 @@ def get_pending_equipment() -> list[dict]:
     query = """
         MATCH (e:Equipment)-[:IS_TYPE_OF]->(d:DeviceType)
         WHERE e.status = 'proposed'
-        RETURN e.id AS id, e.name AS name, d.name AS device_type, e.tenant_id AS tenant_id
+        RETURN e.id AS id, e.name AS name, d.name AS device_type,
+               e.tenant_id AS tenant_id, e.building AS building
     """
     conn = get_connection()
     try:
         with conn.cursor() as cur:
-            sql = f"SELECT * FROM cypher('platform', $${query}$$) AS (id agtype, name agtype, device_type agtype, tenant_id agtype)"
+            sql = f"SELECT * FROM cypher('platform', $${query}$$) AS (id agtype, name agtype, device_type agtype, tenant_id agtype, building agtype)"
             cur.execute(sql)
             rows = cur.fetchall()
             return [
@@ -356,6 +374,7 @@ def get_pending_equipment() -> list[dict]:
                     "equipment_name": str(row[1]).strip('"') if row[1] else None,
                     "device_type": str(row[2]).strip('"') if row[2] else None,
                     "tenant_id": str(row[3]).strip('"') if row[3] else None,
+                    "building": str(row[4]).strip('"') if row[4] and str(row[4]) != 'null' else None,
                 }
                 for row in rows
             ]
@@ -363,9 +382,8 @@ def get_pending_equipment() -> list[dict]:
         conn.close()
 
 
-def get_equipment_rawtags(tenant_id: str, equipment_name: str) -> list[dict]:
-    """Get all RawTags belonging to a specific equipment."""
-    equip_id = f"{tenant_id}:{equipment_name}"
+def get_equipment_rawtags(equip_id: str) -> list[dict]:
+    """Get all RawTags belonging to an equipment (by building-scoped id)."""
     query = f"""
         MATCH (r:RawTag)-[:BELONGS_TO]->(e:Equipment {{id: '{equip_id}'}})
         RETURN r

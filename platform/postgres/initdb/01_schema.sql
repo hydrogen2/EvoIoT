@@ -260,10 +260,12 @@ CREATE OR REPLACE FUNCTION evoiot.get_readings_by_type(
     p_tbox_type TEXT,
     p_tenant_id TEXT DEFAULT null,
     p_start TIMESTAMPTZ DEFAULT now() - interval '1 hour',
-    p_end TIMESTAMPTZ DEFAULT now()
+    p_end TIMESTAMPTZ DEFAULT now(),
+    p_building TEXT DEFAULT null
 ) RETURNS jsonb AS $$
 DECLARE
     v_tenant_id TEXT;
+    v_equip_id TEXT;
     v_has_classification BOOLEAN;
     v_rawtag_ids TEXT[];
     v_result jsonb;
@@ -278,6 +280,20 @@ BEGIN
         current_setting('request.jwt.claims', true)::json->>'tenant_id',
         'default');
 
+    -- Equipment is building-scoped (tenant:building:name). With a building,
+    -- match exactly; without one, resolve by name within the tenant (ambiguous
+    -- if the same name exists in two buildings — pass p_building to disambiguate).
+    IF p_building IS NOT NULL THEN
+        v_equip_id := v_tenant_id || ':' || p_building || ':' || p_equipment;
+    ELSE
+        EXECUTE format(
+            $q$SELECT trim(both '"' from id::text) FROM ag_catalog.cypher('platform', $c$
+                MATCH (e:Equipment {name: %L, tenant_id: %L}) RETURN e.id LIMIT 1
+            $c$) AS (id agtype)$q$, p_equipment, v_tenant_id)
+        INTO v_equip_id;
+        v_equip_id := COALESCE(v_equip_id, v_tenant_id || ':' || p_equipment);
+    END IF;
+
     -- Check if this equipment's RawTag has approved IS_TYPE_OF edge to this type
     v_sql := format(
         $sql$SELECT EXISTS (
@@ -288,7 +304,7 @@ BEGIN
             $cypher$) AS (id agtype)
         )$sql$,
         p_tbox_type,
-        v_tenant_id || ':' || p_equipment
+        v_equip_id
     );
     EXECUTE v_sql INTO v_has_classification;
 
@@ -296,11 +312,12 @@ BEGIN
     IF NOT v_has_classification THEN
         PERFORM net.http_post(
             url := 'http://restate:8080/classifier/' ||
-                   evoiot.b64url(v_tenant_id || ':' || p_equipment || ':' || p_tbox_type) ||
+                   evoiot.b64url(v_equip_id || ':' || p_tbox_type) ||
                    '/run',
             body := jsonb_build_object(
                 'tenant_id', v_tenant_id,
                 'equipment', p_equipment,
+                'equipment_id', v_equip_id,
                 'tbox_types', ARRAY[p_tbox_type]
             ),
             headers := '{"Content-Type": "application/json"}'::jsonb
@@ -326,7 +343,7 @@ BEGIN
             $cypher$) AS (id agtype)
         ) sub$sql$,
         p_tbox_type,
-        v_tenant_id || ':' || p_equipment
+        v_equip_id
     );
     EXECUTE v_sql INTO v_rawtag_ids;
 

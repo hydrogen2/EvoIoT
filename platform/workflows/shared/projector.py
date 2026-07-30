@@ -131,8 +131,12 @@ def rebuild_graph_from_claims() -> dict:
     # Reuse the SAME _project_* helpers the incremental belief-writes use, so a
     # full replay and a single claim produce identical graph state.
     for e in b["equipment"]:
-        tenant, name = e["id"].split(":", 1)
-        graph._project_equipment(tenant, name, e["type"], e["status"])
+        parts = e["id"].split(":")
+        if len(parts) >= 3:            # tenant:building:name (current scheme)
+            tenant, building, name = parts[0], parts[1], ":".join(parts[2:])
+        else:                          # tenant:name (legacy, pre-Stage-4)
+            tenant, building, name = parts[0], "", (parts[1] if len(parts) > 1 else "")
+        graph._project_equipment(tenant, building, name, e["type"], e["status"])
     for m in b["belongs_to"]:
         graph._project_belongs_to(m["rawtag"], m["equip"])
     for c in b["classifications"]:
@@ -140,6 +144,47 @@ def rebuild_graph_from_claims() -> dict:
                                       confidence=c.get("confidence") if c.get("confidence") is not None else 0.0,
                                       reason=c.get("reason") or "")
     return {k: len(v) for k, v in b.items()}
+
+
+# ── Stage 4 migration: de-conflate equipment (building-scope the id) ─
+
+def migrate_building_scope() -> dict:
+    """One-time re-key of equipment from legacy tenant:name to building-scoped
+    tenant:building:name, SPLITTING cross-building conflations (RP+LP CH_1 into
+    HDB:RP:CH_1 and HDB:LP:CH_1). Emits new claims + retracts the legacy ids,
+    then reprojects. Idempotent: already-3-part ids are skipped. Classifications
+    are keyed by RawTag, so they are unaffected."""
+    from collections import defaultdict
+    b = current_belief()
+    eq = {e["id"]: e for e in b["equipment"]}
+
+    # group each legacy equipment's members by their building
+    members: dict = defaultdict(list)
+    for m in b["belongs_to"]:
+        members[(m["equip"], graph.building_of(m["rawtag"]))].append(m["rawtag"])
+
+    migrated, retracted = 0, 0
+    for (old_id, bld), rawtags in members.items():
+        if len(old_id.split(":")) != 2:      # already building-scoped
+            continue
+        e = eq.get(old_id)
+        if not e or not bld:
+            continue
+        tenant, name = old_id.split(":", 1)
+        new_id = graph.equipment_id(tenant, bld, name)
+        pl = {"tenant_id": tenant, "building": bld, "equipment_name": name}
+        graph.append_claim(new_id, "is_type_of", e["type"], e["status"], actor="migrate", payload=pl)
+        for rt in rawtags:
+            graph.append_claim(rt, "belongs_to", new_id, e["status"], actor="migrate", payload=pl)
+        migrated += 1
+
+    for old_id in eq:
+        if len(old_id.split(":")) == 2:       # legacy tenant:name — retract it
+            graph.append_claim(old_id, "ratified", "retracted", "retracted", actor="migrate")
+            retracted += 1
+
+    stats = rebuild_graph_from_claims()
+    return {"new_building_scoped": migrated, "legacy_retracted": retracted, **stats}
 
 
 # ── Diff helper ─────────────────────────────────────────────────────

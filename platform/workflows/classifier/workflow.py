@@ -11,8 +11,9 @@ from shared.traced import traced_run, _emit_event
 class ClassifyRequest(BaseModel):
     """Request to classify raw tags for a specific equipment and point types."""
     tenant_id: str
-    equipment: str          # equipment name (e.g. "PAU_01_103_1")
+    equipment: str          # equipment name (e.g. "PAU_01_103_1"), for display
     tbox_types: list[str]
+    equipment_id: str | None = None   # building-scoped id tenant:building:name
 
 
 # Create the workflow
@@ -34,14 +35,17 @@ async def run(ctx: WorkflowContext, request: ClassifyRequest) -> dict:
     5. Wait for human review
     6. Handle approvals/rejections
     """
+    # Equipment is building-scoped; the read RPC passes the full id.
+    equip_id = request.equipment_id or f"{request.tenant_id}:{request.equipment}"
+
     # Step 1: Fetch RawTags for this equipment
     rawtags = await traced_run(ctx,
         "fetch_rawtags",
-        lambda: graph.get_equipment_rawtags(request.tenant_id, request.equipment)
+        lambda: graph.get_equipment_rawtags(equip_id)
     )
 
     if not rawtags:
-        return {"status": "error", "message": f"No RawTags found for equipment {request.equipment}"}
+        return {"status": "error", "message": f"No RawTags found for equipment {equip_id}"}
 
     # Step 2: Fetch PropertyDefs and equipment info
     property_defs = await traced_run(ctx,
@@ -52,7 +56,7 @@ async def run(ctx: WorkflowContext, request: ClassifyRequest) -> dict:
     # Get equipment type from graph
     equip_info = await traced_run(ctx,
         "fetch_equipment_info",
-        lambda: _get_equipment_type(request.tenant_id, request.equipment)
+        lambda: _get_equipment_type(equip_id)
     )
 
     # Steps 3-6: propose -> review -> (rework with feedback) -> ratify.
@@ -155,9 +159,8 @@ async def review(ctx: WorkflowSharedContext, decisions: list[dict]) -> dict:
 
 # Helper functions
 
-def _get_equipment_type(tenant_id: str, equipment_name: str) -> dict:
-    """Get the device type of an equipment from graph."""
-    equip_id = f"{tenant_id}:{equipment_name}"
+def _get_equipment_type(equip_id: str) -> dict:
+    """Get the device type of an equipment from graph (by building-scoped id)."""
     query = f"""
         MATCH (e:Equipment {{id: '{equip_id}'}})-[:IS_TYPE_OF]->(d:DeviceType)
         RETURN d.name
