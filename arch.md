@@ -268,38 +268,39 @@ Two ways to answer historical questions, chosen by demand:
 ### Current implementation vs target
 
 Honest status — the running system now implements the belief substrate as
-event sourcing + ratification (Stages 1–4a); some pieces remain deferred by
-the just-in-time principle (don't build a distinction until a use case demands
-it):
+event sourcing + ratification (Stages 1–4c); a couple of pieces remain deferred
+by the just-in-time principle (don't build a distinction until a use case
+demands it):
 
 **Built:**
 - **Claims log (`evoiot.events`, belief-bearing subset).** The rows with
   `claim_predicate NOT NULL` (`is_type_of`, `belongs_to`, `classified_as`,
-  `ratified`) are the authoritative claims log. Belief is recorded append-only
-  — a change is a new superseding claim, never an in-place edit.
+  `ratified`, `bms_exists`, `is_export_of`, `observes`) are the authoritative
+  claims log. Belief is recorded append-only — a change is a new superseding
+  claim, never an in-place edit.
 - **Graph is a derived projection.** `shared/projector.py` folds the claims log
   into the AGE graph; `rebuild_graph_from_claims()` is a pure function of the
   log (two rebuilds are byte-identical). The belief-writes append the claim
   first (authoritatively — a failed claim aborts) and project through the same
   `_project_*` helpers the batch rebuild uses, so incremental and replay agree.
   `GRAPH == FOLD(claims)` holds after every write.
-- **Equipment identity is building-scoped** (`tenant:building:name`), so RP's
-  CH_1 and LP's CH_1 are distinct (they had collided under `tenant:name`). The
-  read RPC, discovery review, classifier, and chatapp all resolve equipment
-  building-scoped.
+- **Equipment identity is an opaque surrogate (4b)** (`eq_<uuid>`); the natural
+  key (tenant, building, name) is a *property* used only to resolve it. A review
+  correction — rename, re-type, merge — is a property update, not a re-link of
+  every `BELONGS_TO`. RP's CH_1 and LP's CH_1 are distinct surrogates.
+- **Rawtag identity is BMS-scoped (4c)** — `bms:device:object_type:object_instance`,
+  no organizational label in the id. The **BMS** is a first-class entity (the
+  physical BACnet internetwork; a `device:object` address is unique only within
+  it); building/tenant are its attributes. The datasource↔BMS resolution is
+  recorded as claims — `file —is-export-of→ BMS` and `datasource —observes→ BMS`
+  — so a file export, a BACnet scan, and a live pull of the same point all land
+  on the same `bms:device:object` coordinate and **merge with no per-reading
+  resolution**. Extraction, scan, collector, and the read path are all
+  BMS-scoped.
 
 **Deferred (by the JIT principle — no present use case):**
 - `readings` is still a *separate* physical log from `evoiot.events` — correct
   (numeric head vs structural tail have different physics), not a gap.
-- **Surrogate keys (4b):** equipment id is still a building-scoped *natural*
-  key (`name` in the id). Decoupling it from the mutable name needs
-  signature-based entity resolution; its payoff (robustness to AI naming drift
-  across re-runs, cross-source mention→entity fusion) isn't demanded until we
-  re-run discovery or fuse doc/screenshot mentions.
-- **Channel-scoped rawtag coordinate (4c):** `rawtag_id` still embeds
-  `tenant:building:device:object_type:object_instance`; re-keying onto
-  `<channel>` (building → a link) is warranted when a building rename or edge
-  swap actually happens.
 - Auto-ratified observations as claims, and full bitemporality (see
   [v1 graph — no bitemporality](#v1-graph-current-topology-no-bitemporality)),
   remain directions.
