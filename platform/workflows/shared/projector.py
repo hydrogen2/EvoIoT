@@ -28,20 +28,26 @@ def current_belief() -> dict:
         with conn.cursor() as cur:
             # equipment: type = latest is_type_of; status = latest of
             # (is_type_of | ratified). Retracted/rejected fall out.
+            # id is now an opaque surrogate; the natural key (name/building/
+            # tenant) rides in the is_type_of claim payload.
             cur.execute("""
                 WITH type_latest AS (
-                    SELECT DISTINCT ON (data_id) data_id AS equip, claim_object AS dtype
+                    SELECT DISTINCT ON (data_id) data_id AS equip, claim_object AS dtype, payload
                     FROM evoiot.events WHERE claim_predicate = 'is_type_of'
                     ORDER BY data_id, id DESC),
                 status_latest AS (
                     SELECT DISTINCT ON (data_id) data_id AS equip, claim_status AS status
                     FROM evoiot.events WHERE claim_predicate IN ('is_type_of', 'ratified')
                     ORDER BY data_id, id DESC)
-                SELECT t.equip, t.dtype, s.status
+                SELECT t.equip, t.dtype, s.status, t.payload
                 FROM type_latest t JOIN status_latest s ON s.equip = t.equip
                 WHERE s.status = ANY(%s)
             """, (list(MATERIALIZE),))
-            equipment = [{"id": r[0], "type": r[1], "status": r[2]} for r in cur.fetchall()]
+            equipment = [{"id": r[0], "type": r[1], "status": r[2],
+                          "name": (r[3] or {}).get("equipment_name"),
+                          "building": (r[3] or {}).get("building"),
+                          "tenant": (r[3] or {}).get("tenant_id")}
+                         for r in cur.fetchall()]
             live = {e["id"] for e in equipment}
 
             cur.execute("""
@@ -75,8 +81,11 @@ def snapshot_graph() -> dict:
         with conn.cursor() as cur:
             cur.execute("""SELECT * FROM cypher('platform', $$
                 MATCH (e:Equipment)-[:IS_TYPE_OF]->(d:DeviceType)
-                RETURN e.id, d.name, e.status $$) AS (eid agtype, dtype agtype, status agtype)""")
-            equipment = [{"id": _s(a), "type": _s(b), "status": _s(c)} for a, b, c in cur.fetchall()]
+                RETURN e.id, d.name, e.status, e.name, e.building, e.tenant_id $$)
+                AS (eid agtype, dtype agtype, status agtype, nm agtype, bld agtype, tn agtype)""")
+            equipment = [{"id": _s(a), "type": _s(b), "status": _s(c),
+                          "name": _s(nm), "building": _s(bld), "tenant": _s(tn)}
+                         for a, b, c, nm, bld, tn in cur.fetchall()]
             cur.execute("""SELECT * FROM cypher('platform', $$
                 MATCH (r:RawTag)-[:BELONGS_TO]->(e:Equipment)
                 RETURN r.id, e.id $$) AS (rid agtype, eid agtype)""")
@@ -131,12 +140,8 @@ def rebuild_graph_from_claims() -> dict:
     # Reuse the SAME _project_* helpers the incremental belief-writes use, so a
     # full replay and a single claim produce identical graph state.
     for e in b["equipment"]:
-        parts = e["id"].split(":")
-        if len(parts) >= 3:            # tenant:building:name (current scheme)
-            tenant, building, name = parts[0], parts[1], ":".join(parts[2:])
-        else:                          # tenant:name (legacy, pre-Stage-4)
-            tenant, building, name = parts[0], "", (parts[1] if len(parts) > 1 else "")
-        graph._project_equipment(tenant, building, name, e["type"], e["status"])
+        graph._project_equipment(e["id"], e.get("tenant") or "", e.get("building") or "",
+                                 e.get("name") or "", e["type"], e["status"])
     for m in b["belongs_to"]:
         graph._project_belongs_to(m["rawtag"], m["equip"])
     for c in b["classifications"]:
@@ -148,43 +153,37 @@ def rebuild_graph_from_claims() -> dict:
 
 # ── Stage 4 migration: de-conflate equipment (building-scope the id) ─
 
-def migrate_building_scope() -> dict:
-    """One-time re-key of equipment from legacy tenant:name to building-scoped
-    tenant:building:name, SPLITTING cross-building conflations (RP+LP CH_1 into
-    HDB:RP:CH_1 and HDB:LP:CH_1). Emits new claims + retracts the legacy ids,
-    then reprojects. Idempotent: already-3-part ids are skipped. Classifications
-    are keyed by RawTag, so they are unaffected."""
-    from collections import defaultdict
+def migrate_to_surrogate_ids() -> dict:
+    """One-time re-key of equipment from natural-key ids (tenant:building:name)
+    to opaque surrogates (eq_...), so identity survives a review correction —
+    rename, re-type, merge — without orphaning members. The natural key moves to
+    node properties + the is_type_of claim payload. belongs_to is re-pointed to
+    the surrogate; the old natural-key ids are retracted. Idempotent: ids already
+    eq_-prefixed are skipped."""
     b = current_belief()
-    eq = {e["id"]: e for e in b["equipment"]}
+    old_to_new = {}
+    status_of = {e["id"]: e["status"] for e in b["equipment"]}
+    for e in b["equipment"]:
+        if str(e["id"]).startswith("eq_"):
+            continue
+        new_id = graph._mint_equipment_id()
+        old_to_new[e["id"]] = new_id
+        pl = {"tenant_id": e.get("tenant"), "building": e.get("building"),
+              "equipment_name": e.get("name")}
+        graph.append_claim(new_id, "is_type_of", e["type"], e["status"],
+                           actor="migrate", payload=pl)
 
-    # group each legacy equipment's members by their building
-    members: dict = defaultdict(list)
     for m in b["belongs_to"]:
-        members[(m["equip"], graph.building_of(m["rawtag"]))].append(m["rawtag"])
+        new_id = old_to_new.get(m["equip"])
+        if new_id:
+            graph.append_claim(m["rawtag"], "belongs_to", new_id,
+                               status_of.get(m["equip"], "approved"), actor="migrate")
 
-    migrated, retracted = 0, 0
-    for (old_id, bld), rawtags in members.items():
-        if len(old_id.split(":")) != 2:      # already building-scoped
-            continue
-        e = eq.get(old_id)
-        if not e or not bld:
-            continue
-        tenant, name = old_id.split(":", 1)
-        new_id = graph.equipment_id(tenant, bld, name)
-        pl = {"tenant_id": tenant, "building": bld, "equipment_name": name}
-        graph.append_claim(new_id, "is_type_of", e["type"], e["status"], actor="migrate", payload=pl)
-        for rt in rawtags:
-            graph.append_claim(rt, "belongs_to", new_id, e["status"], actor="migrate", payload=pl)
-        migrated += 1
-
-    for old_id in eq:
-        if len(old_id.split(":")) == 2:       # legacy tenant:name — retract it
-            graph.append_claim(old_id, "ratified", "retracted", "retracted", actor="migrate")
-            retracted += 1
+    for old_id in old_to_new:
+        graph.append_claim(old_id, "ratified", "retracted", "retracted", actor="migrate")
 
     stats = rebuild_graph_from_claims()
-    return {"new_building_scoped": migrated, "legacy_retracted": retracted, **stats}
+    return {"surrogates_minted": len(old_to_new), **stats}
 
 
 # ── Diff helper ─────────────────────────────────────────────────────
@@ -193,7 +192,8 @@ def diff_belief(a: dict, b: dict) -> dict:
     """Set-difference two belief dicts; empty everywhere == identical."""
     def keyset(d, kind):
         if kind == "equipment":
-            return {(x["id"], x["type"], x["status"]) for x in d[kind]}
+            return {(x["id"], x.get("name"), x.get("building"), x["type"], x["status"])
+                    for x in d[kind]}
         if kind == "belongs_to":
             return {(x["rawtag"], x["equip"]) for x in d[kind]}
         return {(x["rawtag"], x["property"], x["status"]) for x in d[kind]}

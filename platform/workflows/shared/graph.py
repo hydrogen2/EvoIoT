@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from .config import (
     POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB,
     POSTGRES_USER, POSTGRES_PASSWORD
@@ -234,17 +235,32 @@ def building_of(rawtag_id: str) -> str:
     return parts[1] if len(parts) > 2 else ""
 
 
-def equipment_id(tenant_id: str, building: str, equipment_name: str) -> str:
-    """Building-scoped equipment identity: tenant:building:name. Building-scoping
-    is what keeps RP's CH_1 and LP's CH_1 distinct (they collided under
-    tenant:name)."""
-    return f"{tenant_id}:{building}:{equipment_name}"
+def _mint_equipment_id() -> str:
+    """A fresh opaque equipment surrogate. Identity is decoupled from the
+    (mutable) name so a review correction — rename, re-type, merge — updates a
+    property instead of orphaning every BELONGS_TO edge."""
+    return "eq_" + uuid.uuid4().hex[:12]
 
 
-def _project_equipment(tenant_id: str, building: str, equipment_name: str,
-                       equipment_type: str, status: str) -> None:
-    """Materialize an equipment's existence + type + status from a claim."""
-    equip_id = equipment_id(tenant_id, building, equipment_name)
+def resolve_equipment(tenant_id: str, building: str, name: str) -> str | None:
+    """Resolve an equipment's surrogate by its natural key (tenant, building,
+    name). Used to keep discovery idempotent (a re-run with the same name maps
+    to the same surrogate) and to let callers reference equipment by name."""
+    b = _sanitize_cypher_string(building)
+    n = _sanitize_cypher_string(name)
+    rows = execute_cypher(
+        f"MATCH (e:Equipment {{tenant_id: '{tenant_id}', building: '{b}', name: '{n}'}}) "
+        f"RETURN e.id")
+    if rows:
+        v = rows[0]
+        return v if isinstance(v, str) else str(v).strip('"')
+    return None
+
+
+def _project_equipment(equip_id: str, tenant_id: str, building: str,
+                       equipment_name: str, equipment_type: str, status: str) -> None:
+    """Materialize an equipment (by surrogate id) — its natural key, type, and
+    status — from a claim."""
     name = _sanitize_cypher_string(equipment_name)
     bld = _sanitize_cypher_string(building)
     etype = _sanitize_cypher_string(equipment_type)
@@ -314,26 +330,31 @@ def create_equipment_and_link(
     equipment_type: str,
     rawtag_id: str,
     status: str = "approved",
-) -> None:
-    """Assert equipment type + membership. The claim is authoritative; the graph
-    is the write-through projection of it."""
+) -> str | None:
+    """Assert equipment type + membership. Resolves the equipment's surrogate by
+    natural key (or mints one), so re-runs are idempotent and the id survives a
+    later rename. The claim is authoritative; the graph is its projection."""
     if not equipment_name or not equipment_type:
-        return
+        return None
     building = building_of(rawtag_id)
-    equip_id = equipment_id(tenant_id, building, equipment_name)
+    equip_id = resolve_equipment(tenant_id, building, equipment_name) or _mint_equipment_id()
     payload = {"tenant_id": tenant_id, "building": building, "equipment_name": equipment_name}
     _require_claim(append_claim(equip_id, "is_type_of", equipment_type, status, payload=payload),
                    f"{equip_id} is_type_of {equipment_type}")
     _require_claim(append_claim(rawtag_id, "belongs_to", equip_id, status, payload=payload),
                    f"{rawtag_id} belongs_to {equip_id}")
-    _project_equipment(tenant_id, building, equipment_name, equipment_type, status)
+    _project_equipment(equip_id, tenant_id, building, equipment_name, equipment_type, status)
     _project_belongs_to(rawtag_id, equip_id)
-    print(f"[graph] Linked RawTag {rawtag_id} -> Equipment {equip_id} -> DeviceType {equipment_type}", flush=True)
+    print(f"[graph] Linked RawTag {rawtag_id} -> Equipment {equip_id} "
+          f"({equipment_name}) -> {equipment_type}", flush=True)
+    return equip_id
 
 
 def update_equipment_status(tenant_id: str, building: str, equipment_name: str, status: str) -> None:
     """Ratify an equipment (status transition). Claim first, then project."""
-    equip_id = equipment_id(tenant_id, building, equipment_name)
+    equip_id = resolve_equipment(tenant_id, building, equipment_name)
+    if not equip_id:
+        return
     payload = {"tenant_id": tenant_id, "building": building, "equipment_name": equipment_name}
     _require_claim(append_claim(equip_id, "ratified", status, status, payload=payload),
                    f"{equip_id} ratified {status}")
@@ -341,17 +362,19 @@ def update_equipment_status(tenant_id: str, building: str, equipment_name: str, 
         _retract_equipment(equip_id)
     else:
         _project_equipment_status(equip_id, status)
-    print(f"[graph] Equipment {equip_id} status -> {status}", flush=True)
+    print(f"[graph] Equipment {equip_id} ({equipment_name}) status -> {status}", flush=True)
 
 
 def delete_equipment(tenant_id: str, building: str, equipment_name: str) -> None:
     """Retract an equipment. Recorded as a retraction claim, not an erasure."""
-    equip_id = equipment_id(tenant_id, building, equipment_name)
+    equip_id = resolve_equipment(tenant_id, building, equipment_name)
+    if not equip_id:
+        return
     payload = {"tenant_id": tenant_id, "building": building, "equipment_name": equipment_name}
     _require_claim(append_claim(equip_id, "ratified", "retracted", "retracted", payload=payload),
                    f"{equip_id} retracted")
     _retract_equipment(equip_id)
-    print(f"[graph] Deleted Equipment {equip_id}", flush=True)
+    print(f"[graph] Deleted Equipment {equip_id} ({equipment_name})", flush=True)
 
 
 def get_pending_equipment() -> list[dict]:

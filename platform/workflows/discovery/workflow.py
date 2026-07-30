@@ -152,14 +152,14 @@ async def run(ctx: WorkflowContext, request: DiscoverRequest) -> dict:
             if d.get("approved"):
                 await traced_run(ctx, f"approve_{name}_r{round_no}",
                     lambda n=name, b=bld: graph.update_equipment_status(request.tenant_id, b, n, "approved"),
-                    data_id=graph.equipment_id(request.tenant_id, bld, name))
+                    data_id=f"{request.tenant_id}:{bld}:{name}")
                 approved.append(by_name[name])
             else:
                 # capture the tags BEFORE deleting — they're the rework scope
                 disputed_tags.update(by_name[name].get("rawtag_ids") or [])
                 await traced_run(ctx, f"reject_{name}_r{round_no}",
                     lambda n=name, b=bld: graph.delete_equipment(request.tenant_id, b, n),
-                    data_id=graph.equipment_id(request.tenant_id, bld, name))
+                    data_id=f"{request.tenant_id}:{bld}:{name}")
                 rejected.append(by_name[name])
                 if d.get("feedback"):
                     notes.append(f"- '{name}' (proposed as {by_name[name]['equipment_type']}) "

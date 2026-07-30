@@ -280,18 +280,26 @@ BEGIN
         current_setting('request.jwt.claims', true)::json->>'tenant_id',
         'default');
 
-    -- Equipment is building-scoped (tenant:building:name). With a building,
-    -- match exactly; without one, resolve by name within the tenant (ambiguous
-    -- if the same name exists in two buildings — pass p_building to disambiguate).
+    -- Equipment id is an opaque surrogate; resolve it from the (name, building)
+    -- natural key. Pass p_building to disambiguate a name shared across two
+    -- buildings (RP/LP CH_1).
     IF p_building IS NOT NULL THEN
-        v_equip_id := v_tenant_id || ':' || p_building || ':' || p_equipment;
+        EXECUTE format(
+            $q$SELECT trim(both '"' from id::text) FROM ag_catalog.cypher('platform', $c$
+                MATCH (e:Equipment {name: %L, building: %L, tenant_id: %L}) RETURN e.id LIMIT 1
+            $c$) AS (id agtype)$q$, p_equipment, p_building, v_tenant_id)
+        INTO v_equip_id;
     ELSE
         EXECUTE format(
             $q$SELECT trim(both '"' from id::text) FROM ag_catalog.cypher('platform', $c$
                 MATCH (e:Equipment {name: %L, tenant_id: %L}) RETURN e.id LIMIT 1
             $c$) AS (id agtype)$q$, p_equipment, v_tenant_id)
         INTO v_equip_id;
-        v_equip_id := COALESCE(v_equip_id, v_tenant_id || ':' || p_equipment);
+    END IF;
+
+    IF v_equip_id IS NULL THEN
+        RETURN jsonb_build_object('status', 'equipment_not_found',
+            'equipment', p_equipment, 'tenant_id', v_tenant_id, 'data', '[]'::jsonb);
     END IF;
 
     -- Check if this equipment's RawTag has approved IS_TYPE_OF edge to this type
