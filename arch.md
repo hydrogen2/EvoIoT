@@ -297,6 +297,10 @@ demands it):
   on the same `bms:device:object` coordinate and **merge with no per-reading
   resolution**. Extraction, scan, collector, and the read path are all
   BMS-scoped.
+- **App layer (chatapp).** One building agent behind chat and app-dev; views
+  and private custom components as specs/claims per [App Layer](#app-layer) —
+  `view_spec` / `component_def` claims in the events log, `config_maps` as the
+  projection, e2e-tested against live RP data.
 
 **Deferred (by the JIT principle — no present use case):**
 - `readings` is still a *separate* physical log from `evoiot.events` — correct
@@ -1120,6 +1124,107 @@ workflow_instances      Restate runtime (per execution)
 Platform developers write the template code once. Building operators configure workflow behaviours through the app. Facilities managers interact with running instances (acknowledge, approve, sign off). Nobody writes flow diagrams or custom code to add a maintenance order workflow — they configure a `maintenance_task` template instance.
 
 New workflow *patterns* that don't fit any template require a developer to write a new Restate handler. This is the hard floor — logic that varies per execution step cannot be expressed as configuration alone.
+
+---
+
+## App Layer
+
+Apps are project-specific and data-driven, so they cannot be built ahead of
+demand — they are configured, and even developed, **just-in-time, through
+chat**. The layer sits on the fluid fan-out side of the
+[bowtie](#what-to-freeze-what-to-keep-fluid-the-bowtie): everything here is a
+projection that can be regenerated, so nothing here is precious. Three theses
+shape it:
+
+- **Light on human attention, capable when unfolded.** Agents automate the
+  routine; what reaches a human is by construction the hard residue, and it
+  needs *more* context per decision, not less. The app is a swiss army knife —
+  folded most of the time, rich exactly where a decision is being asked.
+- **Chat is the control plane; GUI is memoized chat.** A question asked once is
+  answered in chat; asked every morning, it is pinned as a view — literally the
+  same queries the agent ran to answer it, crystallized into blocks. Prebuilt
+  starting views are the same mechanism run at project-setup time, so there is
+  no second codepath. (A third surface — notifications, the attention plane —
+  will carry ratification/exception traffic; not yet built.)
+- **Views are specs, never code.** The LLM composes from closed vocabularies;
+  it does not author software. A bad generation fails validation instead of
+  shipping a bug, and every view is diffable, regenerable, and re-queries the
+  live graph on every render.
+
+### Two vocabularies and a grammar
+
+```
+ FUNCTIONS (verbs)              VIEW SPEC (grammar)            COMPONENTS (nouns)
+ named, read-only queries       JSON: blocks of                hand-built render
+ over graph + readings:    ──▶  {component, query{fn,args},◀── primitives: stat,
+ latest, agg_latest, series,    props, width} — validated,     trend, bars, table,
+ alarms, equipment_*            stored, claimed                alarms, note
+ (+ write actions later)
+```
+
+The same functions serve components and agents — one capability surface, two
+callers. Specs live in `config_maps` (`view:<name>`, the projection) and every
+publish appends a claim to the events log (the provenance) — the same
+claim/projection shape as the graph. The runtime is an interpreter: fetch spec
+→ run queries → mount components → refresh. That interpreter plus the component
+library is the entire hand-written app.
+
+### One agent, two entry points
+
+Chat and app-dev are the **same agent**: a tool loop whose tools are the
+function registry plus `publish_view` / `get_view` / `publish_component` /
+`delete_component`. `/chat` drives it conversationally; `/api/appdev` seeds it
+with a build directive. Grounding is a hard rule — numeric readings may only
+come from tool results, never from the model's priors. `publish_view`
+self-checks liveness before storing (every queried block must return data now,
+except components whose empty state is meaningful), so miswritten matches are
+fixed at generation time, not discovered as dead tiles.
+
+View development is **iterative, not one-shot**: the chat request carries which
+view is open on screen, its spec is injected into the prompt, and "add an
+alarms block to this" republishes the full spec under the same name. The
+operator watches the canvas change — WYSIWYG is the review.
+
+### The generation gradient — where code may be born
+
+Each request lands at the shallowest layer that can express it:
+
+1. **Spec only** (most requests): compose base components.
+2. **Wrap**: a custom component that draws a small delta (a filter dropdown)
+   and delegates to a base component for the rest.
+3. **New JS component** (rare): genuinely novel rendering, written from scratch
+   against the palette and helpers.
+
+Levels 2–3 mean the agent JIT-writes JavaScript — acceptable because the code
+boundary sits at the *component*, a sandboxed leaf with a three-word contract
+(`render(root, data, props)`), never at the view. Custom components run in a
+null-origin sandboxed iframe: no cookies, no same-origin API access; the parent
+feeds each block its live data every refresh and mediates interactive reads
+through a postMessage **query bridge** that reaches read functions only. Worst
+case for bad codegen: one block garbles its own box and falls back to its
+declared `prototype` (the base component it derives from) with the same data.
+
+### Private overlay, no ratification inside an installation
+
+Custom components are **private to the installation** — different operators
+have different, even conflicting needs for "the same" component, so there is no
+commons to protect and therefore nothing to ratify: keep it, tell the chat to
+change it, or delete it and do over. The claims log still versions every
+publish (revert beats regenerate), and an `owner` field exists from day one so
+multi-operator scoping later is a filter, not a migration. Ratification returns
+exactly at the boundaries where it earns its keep: **write actions** to the
+building, **beliefs** about the building (knot 2), and **sharing** — a future
+component hub, where publish-to-commons is the reviewed, versioned act.
+
+### Write actions (deliberate placeholder)
+
+The registry reserves the write verbs (`write_point`, `ratify`) but they return
+`not_implemented` until the edge command path exists. When they land: a button
+in a view is a frozen tool invocation — same named function, same permission
+scope, same audit trail as an agent-initiated action — and deploying an
+action-bearing view is itself a consequential act that flows through
+ratification, with an autonomy dial per decision class (ratify more early,
+auto-apply-with-audit as trust accumulates).
 
 ---
 
